@@ -517,6 +517,11 @@ public class FirebirdToIcebergJob {
         sb.append(", src_system_code STRING");
         sb.append(", extract_dttm TIMESTAMP");
         sb.append(", src_chng_dttm TIMESTAMP");
+        sb.append(") WITH (");
+        sb.append("  'connector' = 'iceberg',");
+        sb.append("  'catalog-name' = 'iceberg',");
+        sb.append("  'partitioning' = 'days(load_dttm)'");
+        sb.append(")");
         return sb.toString();
     }
 
