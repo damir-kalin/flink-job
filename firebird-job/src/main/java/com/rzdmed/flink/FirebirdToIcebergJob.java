@@ -43,6 +43,8 @@ import java.util.Properties;
  *   --firebird-pass   PASSWORD             (по умолчанию: Q1w2e3r+)
  *   --mode            append|replace       (по умолчанию: append) режим записи
  *   --order-by        COLUMN               (по умолчанию: первый столбец каждой таблицы) столбец ORDER BY
+ *   --parallelism     N                    (по умолчанию: 8) уровень параллелизма для записи
+ *   --fetch-size      N                    (по умолчанию: 50000) размер батча для чтения из Firebird
  *
  * Примеры:
  *   # Одна таблица
@@ -60,21 +62,22 @@ import java.util.Properties;
 public class FirebirdToIcebergJob {
 
     // === Defaults ===
-    private static final String DEFAULT_FB_URL = "jdbc:firebirdsql://firebird:3050//firebird/data/testdb.fdb";
-    private static final String DEFAULT_FB_USER = "SYSDBA";
-    private static final String DEFAULT_FB_PASS = "Q1w2e3r+";
+    private static final String DEFAULT_FB_URL = "jdbc:firebirdsql://10.216.1.229:3050/esud_99099";
+    private static final String DEFAULT_FB_USER = "BI_USER";
+    private static final String DEFAULT_FB_PASS = "bi_user_pass";
     private static final String DEFAULT_ICEBERG_DB = "rzdm";
     private static final String DEFAULT_MODE = "append";
-    private static final int DEFAULT_FETCH_SIZE = 10000;
+    private static final int DEFAULT_PARALLELISM = 8;
+    private static final int DEFAULT_FETCH_SIZE = 50000;
     private static final int TECH_COLS_COUNT = 9;
 
     // === Iceberg catalog settings ===
     private static final String ICEBERG_CATALOG_URI = "http://iceberg-rest:8181";
-    private static final String ICEBERG_WAREHOUSE = "s3://iceberg/";
-    private static final String S3_ENDPOINT = "http://minio-svc:9000";
+    private static final String ICEBERG_WAREHOUSE = "s3://rzdm-prod-data-lake/";
+    private static final String S3_ENDPOINT = "https://hb.ru-msk.vkcloud-storage.ru";
     private static final String S3_REGION = "ru-central1";
-    private static final String S3_ACCESS_KEY = "minioadmin";
-    private static final String S3_SECRET_KEY = "Q1w2e3r+";
+    private static final String S3_ACCESS_KEY = "t2n4fuSzpZuPEDT2BWz4jP";
+    private static final String S3_SECRET_KEY = "bREkNH2YMAK8afqKFbvjrYX9ktEJkmwfm2hP2YJV8pqh";
 
     // ======================================================================
 
@@ -89,6 +92,8 @@ public class FirebirdToIcebergJob {
         String fbPass      = getArg(args, "--firebird-pass", DEFAULT_FB_PASS);
         String mode        = getArg(args, "--mode", DEFAULT_MODE);
         String orderBy     = getArg(args, "--order-by", null); // null = auto (first column)
+        int parallelism    = Integer.parseInt(getArg(args, "--parallelism", String.valueOf(DEFAULT_PARALLELISM)));
+        int fetchSize      = Integer.parseInt(getArg(args, "--fetch-size", String.valueOf(DEFAULT_FETCH_SIZE)));
 
         // 2. Строим список пар таблиц Firebird → Iceberg
         List<TableMapping> tableMappings = parseTableMappings(singleTable, tablesArg);
@@ -109,17 +114,20 @@ public class FirebirdToIcebergJob {
         System.out.println("Firebird URL   : " + fbUrl);
         System.out.println("Mode           : " + mode);
         System.out.println("Global order-by: " + (orderBy != null ? orderBy : "auto (first column)"));
+        System.out.println("Parallelism    : " + parallelism);
+        System.out.println("Fetch size     : " + fetchSize);
 
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
-        env.setParallelism(1);
+        env.setParallelism(parallelism);
 
         // Настройка чекпоинтов → S3 (MinIO)
         env.enableCheckpointing(60000, CheckpointingMode.EXACTLY_ONCE);
         CheckpointConfig cpConfig = env.getCheckpointConfig();
         cpConfig.setCheckpointStorage("s3://rzdm-prod-technical-area/flink/checkpoints");
-        cpConfig.setMinPauseBetweenCheckpoints(30000);
+        cpConfig.setMinPauseBetweenCheckpoints(10000); // Уменьшено для более частых checkpoint
         cpConfig.setCheckpointTimeout(600000);
         cpConfig.setMaxConcurrentCheckpoints(1);
+        cpConfig.setTolerableCheckpointFailureNumber(3); // Разрешить несколько неудачных checkpoint
         cpConfig.setExternalizedCheckpointCleanup(
             CheckpointConfig.ExternalizedCheckpointCleanup.RETAIN_ON_CANCELLATION
         );
@@ -185,7 +193,7 @@ public class FirebirdToIcebergJob {
             String sourceUid = "source-" + tm.fbTable.toLowerCase();
             DataStream<Row> data = env
                 .addSource(
-                    new FirebirdDynamicSource(fbUrl, fbUser, fbPass, tm.fbTable, columns, orderByColumn),
+                    new FirebirdDynamicSource(fbUrl, fbUser, fbPass, tm.fbTable, columns, orderByColumn, fetchSize),
                     "firebird-" + tm.fbTable.toLowerCase(),
                     rowTypeInfo
                 )
@@ -497,25 +505,10 @@ public class FirebirdToIcebergJob {
     // ======================================================================
 
     /**
-     * Экранирует имя столбца, если оно является зарезервированным словом в Flink SQL.
+     * Экранирует имя столбца обратными кавычками для безопасного использования в Flink SQL.
      */
     static String escapeColumnName(String columnName) {
-        // Список зарезервированных слов в Flink SQL
-        String[] reservedWords = {
-            "comment", "order", "group", "select", "from", "where", "as", "table",
-            "database", "catalog", "schema", "view", "function", "user", "role",
-            "grant", "revoke", "alter", "create", "drop", "insert", "update", "delete",
-            "truncate", "partition", "primary", "key", "foreign", "references", "constraint",
-            "index", "unique", "not", "null", "default", "check", "with", "watermark"
-        };
-        
-        String lowerName = columnName.toLowerCase();
-        for (String reserved : reservedWords) {
-            if (reserved.equals(lowerName)) {
-                return "`" + columnName + "`";
-            }
-        }
-        return columnName;
+        return "`" + columnName + "`";
     }
 
     /**
@@ -613,6 +606,7 @@ public class FirebirdToIcebergJob {
         private final String tableName;
         private final List<ColumnInfo> columns;
         private final String orderByColumn;
+        private final int fetchSize;
         private volatile boolean running = true;
 
         // === Checkpoint state ===
@@ -621,13 +615,14 @@ public class FirebirdToIcebergJob {
 
         public FirebirdDynamicSource(String url, String user, String password,
                                      String tableName, List<ColumnInfo> columns,
-                                     String orderByColumn) {
+                                     String orderByColumn, int fetchSize) {
             this.url = url;
             this.user = user;
             this.password = password;
             this.tableName = tableName;
             this.columns = columns;
             this.orderByColumn = orderByColumn;
+            this.fetchSize = fetchSize;
         }
 
         // ---------- CheckpointedFunction ----------
@@ -690,7 +685,7 @@ public class FirebirdToIcebergJob {
 
             try (Connection conn = DriverManager.getConnection(url, props);
                  Statement stmt = conn.createStatement()) {
-                stmt.setFetchSize(DEFAULT_FETCH_SIZE);
+                stmt.setFetchSize(fetchSize);
                 try (ResultSet rs = stmt.executeQuery(query.toString())) {
                     long emittedInThisRun = 0;
                     int srcCols = columns.size();
