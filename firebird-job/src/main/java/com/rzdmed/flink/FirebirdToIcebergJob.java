@@ -60,9 +60,9 @@ import java.util.Properties;
 public class FirebirdToIcebergJob {
 
     // === Defaults ===
-    private static final String DEFAULT_FB_URL = "jdbc:firebirdsql://firebird:3050//firebird/data/testdb.fdb";
-    private static final String DEFAULT_FB_USER = "SYSDBA";
-    private static final String DEFAULT_FB_PASS = "Q1w2e3r+";
+    private static final String DEFAULT_FB_URL = "jdbc:firebirdsql://10.216.1.229:3050/esud_99099";
+    private static final String DEFAULT_FB_USER = "BI_USER";
+    private static final String DEFAULT_FB_PASS = "bi_user_pass";
     private static final String DEFAULT_ICEBERG_DB = "rzdm";
     private static final String DEFAULT_MODE = "append";
     private static final int DEFAULT_FETCH_SIZE = 10000;
@@ -70,11 +70,11 @@ public class FirebirdToIcebergJob {
 
     // === Iceberg catalog settings ===
     private static final String ICEBERG_CATALOG_URI = "http://iceberg-rest:8181";
-    private static final String ICEBERG_WAREHOUSE = "s3://iceberg/";
-    private static final String S3_ENDPOINT = "http://minio-svc:9000";
+    private static final String ICEBERG_WAREHOUSE = "s3://rzdm-prod-data-lake/";
+    private static final String S3_ENDPOINT = "https://hb.ru-msk.vkcloud-storage.ru";
     private static final String S3_REGION = "ru-central1";
-    private static final String S3_ACCESS_KEY = "minioadmin";
-    private static final String S3_SECRET_KEY = "Q1w2e3r+";
+    private static final String S3_ACCESS_KEY = "t2n4fuSzpZuPEDT2BWz4jP";
+    private static final String S3_SECRET_KEY = "bREkNH2YMAK8afqKFbvjrYX9ktEJkmwfm2hP2YJV8pqh";
 
     // ======================================================================
 
@@ -110,7 +110,15 @@ public class FirebirdToIcebergJob {
         System.out.println("Mode           : " + mode);
         System.out.println("Global order-by: " + (orderBy != null ? orderBy : "auto (first column)"));
 
-        // 3. Создаём Flink окружение
+        // 3. Настройка S3 файловой системы для checkpoint storage
+        System.setProperty("fs.s3a.access.key", S3_ACCESS_KEY);
+        System.setProperty("fs.s3a.secret.key", S3_SECRET_KEY);
+        System.setProperty("fs.s3a.endpoint", S3_ENDPOINT);
+        System.setProperty("fs.s3a.path.style.access", "true");
+        System.setProperty("fs.s3a.connection.ssl.enabled", "false");
+        System.setProperty("fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem");
+
+        // 4. Создаём Flink окружение
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
         env.setParallelism(1);
 
