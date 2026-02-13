@@ -497,6 +497,28 @@ public class FirebirdToIcebergJob {
     // ======================================================================
 
     /**
+     * Экранирует имя столбца, если оно является зарезервированным словом в Flink SQL.
+     */
+    static String escapeColumnName(String columnName) {
+        // Список зарезервированных слов в Flink SQL
+        String[] reservedWords = {
+            "comment", "order", "group", "select", "from", "where", "as", "table",
+            "database", "catalog", "schema", "view", "function", "user", "role",
+            "grant", "revoke", "alter", "create", "drop", "insert", "update", "delete",
+            "truncate", "partition", "primary", "key", "foreign", "references", "constraint",
+            "index", "unique", "not", "null", "default", "check", "with", "watermark"
+        };
+        
+        String lowerName = columnName.toLowerCase();
+        for (String reserved : reservedWords) {
+            if (reserved.equals(lowerName)) {
+                return "`" + columnName + "`";
+            }
+        }
+        return columnName;
+    }
+
+    /**
      * Генерирует CREATE TABLE SQL для Iceberg.
      */
     static String buildCreateTableSql(String db, String table, List<ColumnInfo> columns) {
@@ -504,7 +526,7 @@ public class FirebirdToIcebergJob {
         sb.append("CREATE TABLE IF NOT EXISTS iceberg.").append(db).append(".").append(table).append(" (");
         for (int i = 0; i < columns.size(); i++) {
             if (i > 0) sb.append(", ");
-            sb.append(columns.get(i).name).append(" ").append(columns.get(i).icebergType);
+            sb.append(escapeColumnName(columns.get(i).name)).append(" ").append(columns.get(i).icebergType);
         }
         // Технические поля
         sb.append(", load_dttm TIMESTAMP NOT NULL");
