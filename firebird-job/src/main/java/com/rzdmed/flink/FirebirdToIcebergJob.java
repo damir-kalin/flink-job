@@ -517,7 +517,6 @@ public class FirebirdToIcebergJob {
         sb.append(", src_system_code STRING");
         sb.append(", extract_dttm TIMESTAMP");
         sb.append(", src_chng_dttm TIMESTAMP");
-        sb.append(") PARTITIONED BY (days(load_dttm))");
         return sb.toString();
     }
 
