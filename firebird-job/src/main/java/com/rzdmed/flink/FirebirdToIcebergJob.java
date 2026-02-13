@@ -265,7 +265,7 @@ public class FirebirdToIcebergJob {
      * Пара: имя таблицы в Firebird → имя таблицы в Iceberg.
      */
     static class TableMapping implements java.io.Serializable {
-        final String fbTable;      // UPPERCASE (Firebird)
+        final String fbTable;      // UPPERCASE (Firebird)'format-version' = '2',
         final String icebergTable; // lowercase (Iceberg)
 
         TableMapping(String fbTable, String icebergTable) {
@@ -518,8 +518,7 @@ public class FirebirdToIcebergJob {
         sb.append(", extract_dttm TIMESTAMP");
         sb.append(", src_chng_dttm TIMESTAMP");
         sb.append(") WITH (");
-        sb.append("  'connector' = 'iceberg',");
-        sb.append("  'catalog-name' = 'iceberg',");
+        sb.append("  'format-version' = '2',");
         sb.append("  'partitioning' = 'days(load_dttm)'");
         sb.append(")");
         return sb.toString();
