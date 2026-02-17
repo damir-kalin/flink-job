@@ -45,6 +45,7 @@ import java.util.Properties;
  *   --order-by        COLUMN               (по умолчанию: первый столбец каждой таблицы) столбец ORDER BY
  *   --parallelism     N                    (по умолчанию: 8) уровень параллелизма для записи
  *   --fetch-size      N                    (по умолчанию: 50000) размер батча для чтения из Firebird
+ *   --batch-size      N                    (по умолчанию: 50) количество таблиц в одном Flink job
  *
  * Примеры:
  *   # Одна таблица
@@ -65,10 +66,11 @@ public class FirebirdToIcebergJob {
     private static final String DEFAULT_FB_URL = "jdbc:firebirdsql://firebird:3050//firebird/data/testdb.fdb";
     private static final String DEFAULT_FB_USER = "SYSDBA";
     private static final String DEFAULT_FB_PASS = "Q1w2e3r+";
-    private static final String DEFAULT_ICEBERG_DB = "rzdm";
+    private static final String DEFAULT_ICEBERG_DB = "rzdm__mis";
     private static final String DEFAULT_MODE = "append";
     private static final int DEFAULT_PARALLELISM = 8;
     private static final int DEFAULT_FETCH_SIZE = 50000;
+    private static final int DEFAULT_BATCH_SIZE = 50;
     private static final int TECH_COLS_COUNT = 9;
 
     // === Iceberg catalog settings ===
@@ -94,6 +96,7 @@ public class FirebirdToIcebergJob {
         String orderBy     = getArg(args, "--order-by", null); // null = auto (first column)
         int parallelism    = Integer.parseInt(getArg(args, "--parallelism", String.valueOf(DEFAULT_PARALLELISM)));
         int fetchSize      = Integer.parseInt(getArg(args, "--fetch-size", String.valueOf(DEFAULT_FETCH_SIZE)));
+        int batchSize      = Integer.parseInt(getArg(args, "--batch-size", String.valueOf(DEFAULT_BATCH_SIZE)));
 
         // 2. Строим список пар таблиц Firebird → Iceberg
         List<TableMapping> tableMappings = parseTableMappings(singleTable, tablesArg);
@@ -116,6 +119,7 @@ public class FirebirdToIcebergJob {
         System.out.println("Global order-by: " + (orderBy != null ? orderBy : "auto (first column)"));
         System.out.println("Parallelism    : " + parallelism);
         System.out.println("Fetch size     : " + fetchSize);
+        System.out.println("Batch size     : " + batchSize + " tables per job");
 
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
         env.setParallelism(parallelism);
@@ -154,16 +158,41 @@ public class FirebirdToIcebergJob {
 
         tableEnv.executeSql("CREATE DATABASE IF NOT EXISTS iceberg." + icebergDb);
 
-        // 5. Для каждой таблицы: читаем метаданные, создаём Iceberg таблицу,
-        //    создаём Source DataStream и регистрируем как view
-        StatementSet stmtSet = tableEnv.createStatementSet();
+        // 5. Обрабатываем таблицы батчами для избежания проблем с большим количеством операторов
+        int totalTables = tableMappings.size();
+        int processedTables = 0;
+        int batchNumber = 1;
 
-        for (TableMapping tm : tableMappings) {
+        while (processedTables < totalTables) {
+            int batchStart = processedTables;
+            int batchEnd = Math.min(processedTables + batchSize, totalTables);
+            List<TableMapping> currentBatch = tableMappings.subList(batchStart, batchEnd);
+            
+            System.out.println();
+            System.out.println("=== Processing batch " + batchNumber + ": tables " + (batchStart + 1) + "-" + batchEnd + " of " + totalTables + " ===");
+            
+            // Создаём новый StatementSet для каждого батча
+            StatementSet stmtSet = tableEnv.createStatementSet();
+
+            for (TableMapping tm : currentBatch) {
             System.out.println();
             System.out.println("--- Configuring table: " + tm.fbTable + " → " + tm.icebergTable + " ---");
 
-            // 5a. Читаем метаданные
-            List<ColumnInfo> columns = readTableMetadata(fbUrl, fbUser, fbPass, tm.fbTable);
+            // 5a. Проверяем доступ к таблице
+            if (!checkTableAccess(fbUrl, fbUser, fbPass, tm.fbTable)) {
+                System.err.println("WARNING: No SELECT access to table '" + tm.fbTable + "'. Skipping.");
+                continue;
+            }
+
+            // 5b. Читаем метаданные
+            List<ColumnInfo> columns;
+            try {
+                columns = readTableMetadata(fbUrl, fbUser, fbPass, tm.fbTable);
+            } catch (Exception e) {
+                System.err.println("ERROR: Failed to read metadata for table '" + tm.fbTable + "': " + e.getMessage() + ". Skipping.");
+                continue;
+            }
+            
             if (columns.isEmpty()) {
                 System.err.println("ERROR: Table '" + tm.fbTable + "' not found or has no columns! Skipping.");
                 continue;
@@ -174,13 +203,13 @@ public class FirebirdToIcebergJob {
                 System.out.println("    " + col.name + " : " + col.icebergType + " (JDBC type: " + col.jdbcType + ")");
             }
 
-            // 5b. Определяем ORDER BY (глобальный или первый столбец таблицы)
+            // 5c. Определяем ORDER BY (глобальный или первый столбец таблицы)
             String orderByColumn = (orderBy != null && !orderBy.isEmpty())
                     ? orderBy.toUpperCase()
                     : columns.get(0).name.toUpperCase();
             System.out.println("  Order by: " + orderByColumn);
 
-            // 5c. Создаём/пересоздаём Iceberg таблицу
+            // 5d. Создаём/пересоздаём Iceberg таблицу
             if ("replace".equalsIgnoreCase(mode)) {
                 tableEnv.executeSql("DROP TABLE IF EXISTS iceberg." + icebergDb + "." + tm.icebergTable);
             }
@@ -188,7 +217,7 @@ public class FirebirdToIcebergJob {
             System.out.println("  Creating Iceberg table: " + createSql);
             tableEnv.executeSql(createSql);
 
-            // 5d. Создаём Source DataStream с уникальным uid для checkpoint state
+            // 5e. Создаём Source DataStream с уникальным uid для checkpoint state
             RowTypeInfo rowTypeInfo = buildRowTypeInfo(columns);
             String sourceUid = "source-" + tm.fbTable.toLowerCase();
             DataStream<Row> data = env
@@ -201,30 +230,83 @@ public class FirebirdToIcebergJob {
 
             System.out.println("  Source operator uid: " + sourceUid);
 
-            // 5e. Регистрируем как временное представление
+            // 5f. Регистрируем как временное представление
             String viewName = "source_" + tm.fbTable.toLowerCase();
             Schema schema = buildSchema(columns);
             tableEnv.createTemporaryView(viewName, data, schema);
 
-            // 5f. Добавляем INSERT в StatementSet
+            // 5g. Добавляем INSERT в StatementSet
             String insertSql = "INSERT INTO iceberg." + icebergDb + "." + tm.icebergTable
                               + " SELECT * FROM " + viewName;
             System.out.println("  Insert SQL: " + insertSql);
-            stmtSet.addInsertSql(insertSql);
+                stmtSet.addInsertSql(insertSql);
+            }
+
+            // 6. Выполняем текущий батч как отдельный Flink job
+            System.out.println();
+            System.out.println("=== Executing batch " + batchNumber + ": " + currentBatch.size() + " table(s) ===");
+
+            TableResult result = stmtSet.execute();
+            try {
+                result.await();
+                System.out.println("=== Batch " + batchNumber + " completed successfully ===");
+            } catch (Exception e) {
+                System.err.println("ERROR: Batch " + batchNumber + " failed: " + e.getMessage());
+                System.err.println("Continuing with next batch...");
+            }
+
+            processedTables = batchEnd;
+            batchNumber++;
+            
+            // Если есть ещё таблицы, создаём новое окружение для следующего батча
+            if (processedTables < totalTables) {
+                System.out.println();
+                System.out.println("Preparing next batch...");
+                env = StreamExecutionEnvironment.getExecutionEnvironment();
+                env.setParallelism(parallelism);
+                
+                // Настройка S3 файловой системы для checkpoint storage
+                System.setProperty("fs.s3a.access.key", S3_ACCESS_KEY);
+                System.setProperty("fs.s3a.secret.key", S3_SECRET_KEY);
+                System.setProperty("fs.s3a.endpoint", S3_ENDPOINT);
+                System.setProperty("fs.s3a.path.style.access", "true");
+                System.setProperty("fs.s3a.connection.ssl.enabled", "false");
+                System.setProperty("fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem");
+                
+                // Настройка чекпоинтов для нового окружения
+                env.enableCheckpointing(60000, CheckpointingMode.EXACTLY_ONCE);
+                CheckpointConfig cpConfigBatch = env.getCheckpointConfig();
+                cpConfigBatch.setCheckpointStorage("s3://rzdm-prod-technical-area/flink/checkpoints");
+                cpConfigBatch.setMinPauseBetweenCheckpoints(10000);
+                cpConfigBatch.setCheckpointTimeout(600000);
+                cpConfigBatch.setMaxConcurrentCheckpoints(1);
+                cpConfigBatch.setTolerableCheckpointFailureNumber(3);
+                cpConfigBatch.setExternalizedCheckpointCleanup(
+                    CheckpointConfig.ExternalizedCheckpointCleanup.RETAIN_ON_CANCELLATION
+                );
+                
+                tableEnv = StreamTableEnvironment.create(env);
+                
+                // Пересоздаём Iceberg каталог для нового окружения
+                tableEnv.executeSql(
+                    "CREATE CATALOG iceberg WITH (" +
+                    "  'type' = 'iceberg'," +
+                    "  'catalog-impl' = 'org.apache.iceberg.rest.RESTCatalog'," +
+                    "  'uri' = '" + ICEBERG_CATALOG_URI + "'," +
+                    "  'warehouse' = '" + ICEBERG_WAREHOUSE + "'," +
+                    "  'io-impl' = 'org.apache.iceberg.aws.s3.S3FileIO'," +
+                    "  's3.endpoint' = '" + S3_ENDPOINT + "'," +
+                    "  's3.path-style-access' = 'true'," +
+                    "  'client.region' = '" + S3_REGION + "'," +
+                    "  's3.access-key-id' = '" + S3_ACCESS_KEY + "'," +
+                    "  's3.secret-access-key' = '" + S3_SECRET_KEY + "'" +
+                    ")"
+                );
+            }
         }
 
-        // 6. Выполняем все INSERT как единый Flink job
         System.out.println();
-        System.out.println("=== Executing " + tableMappings.size() + " table(s) as a single Flink job ===");
-
-        TableResult result = stmtSet.execute();
-        try {
-            result.await();
-        } catch (Exception e) {
-            System.out.println("Job submitted (await not supported in this mode): " + e.getMessage());
-        }
-
-        System.out.println("=== Transfer complete! ===");
+        System.out.println("=== Transfer complete! Processed " + processedTables + " table(s) in " + (batchNumber - 1) + " batch(es) ===");
     }
 
     // ======================================================================
@@ -291,6 +373,43 @@ public class FirebirdToIcebergJob {
     // ======================================================================
 
     /**
+     * Проверяет доступ к таблице, выполняя простой SELECT запрос.
+     * @return true если доступ есть, false если нет доступа
+     */
+    static boolean checkTableAccess(String url, String user, String pass, String tableName) {
+        Properties props = new Properties();
+        props.setProperty("user", user);
+        props.setProperty("password", pass);
+        props.setProperty("encoding", "UTF8");
+        props.setProperty("authPlugins", "Srp256,Srp,Legacy_Auth");
+
+        try {
+            Class.forName("org.firebirdsql.jdbc.FBDriver");
+            try (Connection conn = DriverManager.getConnection(url, props);
+                 Statement stmt = conn.createStatement()) {
+                // Пробуем выполнить простой SELECT с LIMIT 1
+                String testQuery = "SELECT 1 FROM " + tableName + " ROWS 1";
+                stmt.executeQuery(testQuery);
+                return true;
+            }
+        } catch (SQLException e) {
+            // Проверяем, является ли это ошибкой доступа
+            String errorMsg = e.getMessage().toLowerCase();
+            if (errorMsg.contains("no permission") || 
+                errorMsg.contains("access denied") ||
+                errorMsg.contains("permission") ||
+                (e.getSQLState() != null && e.getSQLState().equals("28000"))) {
+                return false;
+            }
+            // Другие ошибки (таблица не существует и т.д.) тоже считаем отсутствием доступа
+            return false;
+        } catch (Exception e) {
+            // Любые другие исключения считаем отсутствием доступа
+            return false;
+        }
+    }
+
+    /**
      * Читает метаданные столбцов таблицы из Firebird через JDBC DatabaseMetaData.
      */
     static List<ColumnInfo> readTableMetadata(String url, String user, String pass, String tableName) throws Exception {
@@ -309,10 +428,16 @@ public class FirebirdToIcebergJob {
                 while (rs.next()) {
                     String colName = rs.getString("COLUMN_NAME").trim();
                     int jdbcType = rs.getInt("DATA_TYPE");
-                    String typeName = rs.getString("TYPE_NAME").trim();
+                    String typeName = rs.getString("TYPE_NAME").trim().toUpperCase();
                     int precision = rs.getInt("COLUMN_SIZE");
                     int scale = rs.getInt("DECIMAL_DIGITS");
                     boolean nullable = rs.getInt("NULLABLE") != DatabaseMetaData.columnNoNulls;
+
+                    // Пропускаем ТОЛЬКО столбцы типа BLOB
+                    if (jdbcType == java.sql.Types.BLOB || typeName.contains("BLOB")) {
+                        System.out.println("  SKIPPING column '" + colName + "' (BLOB type: " + typeName + ")");
+                        continue;
+                    }
 
                     ColumnInfo col = new ColumnInfo();
                     col.name = colName.toLowerCase();
@@ -722,6 +847,21 @@ public class FirebirdToIcebergJob {
                     System.out.println("Total emitted in this run: " + emittedInThisRun
                         + " (total offset: " + rowsProcessed + ") from " + tableName);
                 }
+            } catch (SQLException e) {
+                // Проверяем, является ли это ошибкой доступа
+                String errorMsg = e.getMessage().toLowerCase();
+                if (errorMsg.contains("no permission") || 
+                    errorMsg.contains("access denied") ||
+                    errorMsg.contains("permission") ||
+                    (e.getSQLState() != null && e.getSQLState().equals("28000"))) {
+                    System.err.println("ERROR: No SELECT access to table '" + tableName + "'. " +
+                                     "Source will terminate gracefully. Error: " + e.getMessage());
+                    // Завершаем источник корректно вместо падения
+                    running = false;
+                    return;
+                }
+                // Другие SQL ошибки пробрасываем дальше
+                throw e;
             }
         }
 
