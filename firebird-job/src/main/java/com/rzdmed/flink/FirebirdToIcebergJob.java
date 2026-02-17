@@ -209,34 +209,39 @@ public class FirebirdToIcebergJob {
                     : columns.get(0).name.toUpperCase();
             System.out.println("  Order by: " + orderByColumn);
 
-            // 5d. Создаём/пересоздаём Iceberg таблицу
+            // 5d. Экранируем имя таблицы Iceberg (может содержать $)
+            String escapedIcebergTable = "`" + tm.icebergTable + "`";
+            String fullIcebergPath = "iceberg." + icebergDb + "." + escapedIcebergTable;
+
+            // 5e. Создаём/пересоздаём Iceberg таблицу
             if ("replace".equalsIgnoreCase(mode)) {
-                tableEnv.executeSql("DROP TABLE IF EXISTS iceberg." + icebergDb + "." + tm.icebergTable);
+                tableEnv.executeSql("DROP TABLE IF EXISTS " + fullIcebergPath);
             }
             String createSql = buildCreateTableSql(icebergDb, tm.icebergTable, columns);
             System.out.println("  Creating Iceberg table: " + createSql);
             tableEnv.executeSql(createSql);
 
-            // 5e. Создаём Source DataStream с уникальным uid для checkpoint state
+            // 5f. Создаём Source DataStream с уникальным uid для checkpoint state
             RowTypeInfo rowTypeInfo = buildRowTypeInfo(columns);
-            String sourceUid = "source-" + tm.fbTable.toLowerCase();
+            String safeTableName = tm.fbTable.toLowerCase().replace("$", "_");
+            String sourceUid = "source-" + safeTableName;
             DataStream<Row> data = env
                 .addSource(
                     new FirebirdDynamicSource(fbUrl, fbUser, fbPass, tm.fbTable, columns, orderByColumn, fetchSize),
-                    "firebird-" + tm.fbTable.toLowerCase(),
+                    "firebird-" + safeTableName,
                     rowTypeInfo
                 )
                 .uid(sourceUid);
 
             System.out.println("  Source operator uid: " + sourceUid);
 
-            // 5f. Регистрируем как временное представление
-            String viewName = "source_" + tm.fbTable.toLowerCase();
+            // 5g. Регистрируем как временное представление
+            String viewName = "source_" + safeTableName;
             Schema schema = buildSchema(columns);
             tableEnv.createTemporaryView(viewName, data, schema);
 
-            // 5g. Добавляем INSERT в StatementSet
-            String insertSql = "INSERT INTO iceberg." + icebergDb + "." + tm.icebergTable
+            // 5h. Добавляем INSERT в StatementSet
+            String insertSql = "INSERT INTO " + fullIcebergPath
                               + " SELECT * FROM " + viewName;
             System.out.println("  Insert SQL: " + insertSql);
                 stmtSet.addInsertSql(insertSql);
@@ -641,7 +646,7 @@ public class FirebirdToIcebergJob {
      */
     static String buildCreateTableSql(String db, String table, List<ColumnInfo> columns) {
         StringBuilder sb = new StringBuilder();
-        sb.append("CREATE TABLE IF NOT EXISTS iceberg.").append(db).append(".").append(table).append(" (");
+        sb.append("CREATE TABLE IF NOT EXISTS iceberg.").append(db).append(".`").append(table).append("` (");
         for (int i = 0; i < columns.size(); i++) {
             if (i > 0) sb.append(", ");
             sb.append(escapeColumnName(columns.get(i).name)).append(" ").append(columns.get(i).icebergType);
