@@ -209,9 +209,8 @@ public class FirebirdToIcebergJob {
                     : columns.get(0).name.toUpperCase();
             System.out.println("  Order by: " + orderByColumn);
 
-            // 5d. Экранируем имя таблицы Iceberg (может содержать $)
-            String escapedIcebergTable = "`" + tm.icebergTable + "`";
-            String fullIcebergPath = "iceberg." + icebergDb + "." + escapedIcebergTable;
+            // 5d. Полный путь к таблице Iceberg
+            String fullIcebergPath = "iceberg." + icebergDb + "." + tm.icebergTable;
 
             // 5e. Создаём/пересоздаём Iceberg таблицу
             if ("replace".equalsIgnoreCase(mode)) {
@@ -319,6 +318,14 @@ public class FirebirdToIcebergJob {
     // ======================================================================
 
     /**
+     * Заменяет недопустимые символы в имени таблицы Iceberg.
+     * Iceberg не поддерживает $ в именах таблиц.
+     */
+    static String sanitizeIcebergName(String name) {
+        return name.replace("$", "_");
+    }
+
+    /**
      * Парсит список пар таблиц из аргументов --table / --tables.
      *
      * Форматы --tables:
@@ -341,14 +348,14 @@ public class FirebirdToIcebergJob {
                 } else {
                     mappings.add(new TableMapping(
                         entry.toUpperCase(),
-                        entry.toLowerCase()
+                        sanitizeIcebergName(entry.toLowerCase())
                     ));
                 }
             }
         } else if (singleTable != null && !singleTable.isEmpty()) {
             mappings.add(new TableMapping(
                 singleTable.toUpperCase(),
-                singleTable.toLowerCase()
+                sanitizeIcebergName(singleTable.toLowerCase())
             ));
         }
 
@@ -646,7 +653,7 @@ public class FirebirdToIcebergJob {
      */
     static String buildCreateTableSql(String db, String table, List<ColumnInfo> columns) {
         StringBuilder sb = new StringBuilder();
-        sb.append("CREATE TABLE IF NOT EXISTS iceberg.").append(db).append(".`").append(table).append("` (");
+        sb.append("CREATE TABLE IF NOT EXISTS iceberg.").append(db).append(".").append(table).append(" (");
         for (int i = 0; i < columns.size(); i++) {
             if (i > 0) sb.append(", ");
             sb.append(escapeColumnName(columns.get(i).name)).append(" ").append(columns.get(i).icebergType);
