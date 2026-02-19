@@ -72,6 +72,10 @@ public class FirebirdToIcebergJob {
     private static final int DEFAULT_FETCH_SIZE = 50000;
     private static final int DEFAULT_BATCH_SIZE = 50;
     private static final int TECH_COLS_COUNT = 9;
+    private static final String[] TECH_COL_BASE_NAMES = {
+        "load_dttm", "load_dttm_tz", "load_id", "op", "ts_ms",
+        "source_ts_ms", "src_system_code", "extract_dttm", "src_chng_dttm"
+    };
 
     // === Iceberg catalog settings ===
     private static final String ICEBERG_CATALOG_URI = "http://iceberg-rest:8181";
@@ -649,28 +653,49 @@ public class FirebirdToIcebergJob {
     }
 
     /**
+     * Формирует имена технических столбцов с учётом конфликтов с исходными столбцами таблицы.
+     * Если имя технического столбца совпадает с именем столбца из Firebird,
+     * добавляется префикс "__".
+     */
+    static String[] resolveTechColumnNames(List<ColumnInfo> columns) {
+        java.util.Set<String> sourceNames = new java.util.HashSet<>();
+        for (ColumnInfo col : columns) {
+            sourceNames.add(col.name.toLowerCase());
+        }
+
+        String[] resolved = new String[TECH_COL_BASE_NAMES.length];
+        for (int i = 0; i < TECH_COL_BASE_NAMES.length; i++) {
+            String name = TECH_COL_BASE_NAMES[i];
+            if (sourceNames.contains(name)) {
+                resolved[i] = "__" + name;
+                System.out.println("  CONFLICT: column '" + name + "' exists in source, tech column renamed to '__" + name + "'");
+            } else {
+                resolved[i] = name;
+            }
+        }
+        return resolved;
+    }
+
+    /**
      * Генерирует CREATE TABLE SQL для Iceberg.
      */
     static String buildCreateTableSql(String db, String table, List<ColumnInfo> columns) {
+        String[] techNames = resolveTechColumnNames(columns);
+
         StringBuilder sb = new StringBuilder();
         sb.append("CREATE TABLE IF NOT EXISTS iceberg.").append(db).append(".").append(table).append(" (");
         for (int i = 0; i < columns.size(); i++) {
             if (i > 0) sb.append(", ");
             sb.append(escapeColumnName(columns.get(i).name)).append(" ").append(columns.get(i).icebergType);
         }
-        // Технические поля
-        sb.append(", load_dttm TIMESTAMP NOT NULL");
-        sb.append(", load_dttm_tz TIMESTAMP");
-        sb.append(", load_id BIGINT");
-        sb.append(", op STRING");
-        sb.append(", ts_ms BIGINT");
-        sb.append(", source_ts_ms BIGINT");
-        sb.append(", src_system_code STRING");
-        sb.append(", extract_dttm TIMESTAMP");
-        sb.append(", src_chng_dttm TIMESTAMP");
+        // Технические поля (имена зависят от наличия конфликтов)
+        String[] techTypes = {"TIMESTAMP NOT NULL", "TIMESTAMP", "BIGINT", "STRING", "BIGINT", "BIGINT", "STRING", "TIMESTAMP", "TIMESTAMP"};
+        for (int i = 0; i < techNames.length; i++) {
+            sb.append(", ").append(escapeColumnName(techNames[i])).append(" ").append(techTypes[i]);
+        }
         sb.append(") WITH (");
         sb.append("  'format-version' = '2',");
-        sb.append("  'partitioning' = 'days(load_dttm)'");
+        sb.append("  'partitioning' = 'days(").append(techNames[0]).append(")'");
         sb.append(")");
         return sb.toString();
     }
@@ -679,6 +704,8 @@ public class FirebirdToIcebergJob {
      * Строит RowTypeInfo для DataStream.
      */
     static RowTypeInfo buildRowTypeInfo(List<ColumnInfo> columns) {
+        String[] techNames = resolveTechColumnNames(columns);
+
         int total = columns.size() + TECH_COLS_COUNT;
         TypeInformation<?>[] types = new TypeInformation[total];
         String[] names = new String[total];
@@ -686,17 +713,17 @@ public class FirebirdToIcebergJob {
             types[i] = columns.get(i).flinkType;
             names[i] = columns.get(i).name;
         }
-        // Технические поля
+        // Технические поля (имена зависят от наличия конфликтов)
+        TypeInformation<?>[] techTypes = {
+            Types.LOCAL_DATE_TIME, Types.LOCAL_DATE_TIME, Types.LONG,
+            Types.STRING, Types.LONG, Types.LONG,
+            Types.STRING, Types.LOCAL_DATE_TIME, Types.LOCAL_DATE_TIME
+        };
         int o = columns.size();
-        types[o]     = Types.LOCAL_DATE_TIME; names[o]     = "load_dttm";
-        types[o + 1] = Types.LOCAL_DATE_TIME; names[o + 1] = "load_dttm_tz";
-        types[o + 2] = Types.LONG;            names[o + 2] = "load_id";
-        types[o + 3] = Types.STRING;          names[o + 3] = "op";
-        types[o + 4] = Types.LONG;            names[o + 4] = "ts_ms";
-        types[o + 5] = Types.LONG;            names[o + 5] = "source_ts_ms";
-        types[o + 6] = Types.STRING;          names[o + 6] = "src_system_code";
-        types[o + 7] = Types.LOCAL_DATE_TIME; names[o + 7] = "extract_dttm";
-        types[o + 8] = Types.LOCAL_DATE_TIME; names[o + 8] = "src_chng_dttm";
+        for (int i = 0; i < techNames.length; i++) {
+            types[o + i] = techTypes[i];
+            names[o + i] = techNames[i];
+        }
         return new RowTypeInfo(types, names);
     }
 
@@ -704,20 +731,23 @@ public class FirebirdToIcebergJob {
      * Строит Schema для Table API.
      */
     static Schema buildSchema(List<ColumnInfo> columns) {
+        String[] techNames = resolveTechColumnNames(columns);
+
         Schema.Builder builder = Schema.newBuilder();
         for (ColumnInfo col : columns) {
             builder.column(col.name, col.flinkDataType);
         }
-        // Технические поля
-        builder.column("load_dttm",        DataTypes.TIMESTAMP(6).notNull());
-        builder.column("load_dttm_tz",     DataTypes.TIMESTAMP(6).nullable());
-        builder.column("load_id",          DataTypes.BIGINT().nullable());
-        builder.column("op",               DataTypes.STRING().nullable());
-        builder.column("ts_ms",            DataTypes.BIGINT().nullable());
-        builder.column("source_ts_ms",     DataTypes.BIGINT().nullable());
-        builder.column("src_system_code",  DataTypes.STRING().nullable());
-        builder.column("extract_dttm",     DataTypes.TIMESTAMP(6).nullable());
-        builder.column("src_chng_dttm",    DataTypes.TIMESTAMP(6).nullable());
+        // Технические поля (имена зависят от наличия конфликтов)
+        org.apache.flink.table.types.DataType[] techDataTypes = {
+            DataTypes.TIMESTAMP(6).notNull(), DataTypes.TIMESTAMP(6).nullable(),
+            DataTypes.BIGINT().nullable(), DataTypes.STRING().nullable(),
+            DataTypes.BIGINT().nullable(), DataTypes.BIGINT().nullable(),
+            DataTypes.STRING().nullable(), DataTypes.TIMESTAMP(6).nullable(),
+            DataTypes.TIMESTAMP(6).nullable()
+        };
+        for (int i = 0; i < techNames.length; i++) {
+            builder.column(techNames[i], techDataTypes[i]);
+        }
         return builder.build();
     }
 
