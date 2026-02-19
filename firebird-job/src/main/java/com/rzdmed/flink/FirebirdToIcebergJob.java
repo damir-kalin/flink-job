@@ -63,9 +63,9 @@ import java.util.Properties;
 public class FirebirdToIcebergJob {
 
     // === Defaults ===
-    private static final String DEFAULT_FB_URL = "jdbc:firebirdsql://firebird:3050//firebird/data/testdb.fdb";
-    private static final String DEFAULT_FB_USER = "SYSDBA";
-    private static final String DEFAULT_FB_PASS = "Q1w2e3r+";
+    private static final String DEFAULT_FB_URL = "jdbc:firebirdsql://10.216.1.229:3050/esud_99099";
+    private static final String DEFAULT_FB_USER = "BI_USER";
+    private static final String DEFAULT_FB_PASS = "bi_user_pass";
     private static final String DEFAULT_ICEBERG_DB = "rzdm__mis";
     private static final String DEFAULT_MODE = "append";
     private static final int DEFAULT_PARALLELISM = 8;
@@ -79,11 +79,11 @@ public class FirebirdToIcebergJob {
 
     // === Iceberg catalog settings ===
     private static final String ICEBERG_CATALOG_URI = "http://iceberg-rest:8181";
-    private static final String ICEBERG_WAREHOUSE = "s3://iceberg/";
-    private static final String S3_ENDPOINT = "http://minio-svc:9000";
+    private static final String ICEBERG_WAREHOUSE = "s3://rzdm-prod-data-lake/";
+    private static final String S3_ENDPOINT = "https://hb.ru-msk.vkcloud-storage.ru";
     private static final String S3_REGION = "ru-central1";
-    private static final String S3_ACCESS_KEY = "minioadmin";
-    private static final String S3_SECRET_KEY = "Q1w2e3r+";
+    private static final String S3_ACCESS_KEY = "t2n4fuSzpZuPEDT2BWz4jP";
+    private static final String S3_SECRET_KEY = "bREkNH2YMAK8afqKFbvjrYX9ktEJkmwfm2hP2YJV8pqh";
 
     // ======================================================================
 
@@ -214,7 +214,7 @@ public class FirebirdToIcebergJob {
             System.out.println("  Order by: " + orderByColumn);
 
             // 5d. Полный путь к таблице Iceberg
-            String fullIcebergPath = "iceberg." + icebergDb + "." + tm.icebergTable;
+            String fullIcebergPath = "iceberg." + icebergDb + ".`" + tm.icebergTable + "`";
 
             // 5e. Создаём/пересоздаём Iceberg таблицу
             if ("replace".equalsIgnoreCase(mode)) {
@@ -589,7 +589,7 @@ public class FirebirdToIcebergJob {
             case java.sql.Types.VARBINARY:
             case java.sql.Types.LONGVARBINARY:
             case java.sql.Types.BLOB:
-                return "BINARY";
+                return "BYTES";
 
             default:
                 return "STRING";
@@ -683,7 +683,7 @@ public class FirebirdToIcebergJob {
         String[] techNames = resolveTechColumnNames(columns);
 
         StringBuilder sb = new StringBuilder();
-        sb.append("CREATE TABLE IF NOT EXISTS iceberg.").append(db).append(".").append(table).append(" (");
+        sb.append("CREATE TABLE IF NOT EXISTS iceberg.").append(db).append(".`").append(table).append("` (");
         for (int i = 0; i < columns.size(); i++) {
             if (i > 0) sb.append(", ");
             sb.append(escapeColumnName(columns.get(i).name)).append(" ").append(columns.get(i).icebergType);
