@@ -131,7 +131,7 @@ public class FirebirdToIcebergJob {
         // Настройка чекпоинтов → S3 (MinIO)
         env.enableCheckpointing(60000, CheckpointingMode.EXACTLY_ONCE);
         CheckpointConfig cpConfig = env.getCheckpointConfig();
-        cpConfig.setCheckpointStorage("s3://rzdm-prod-technical-area/flink/checkpoints");
+        cpConfig.setCheckpointStorage("s3://rzdm-test-technical-area/flink/checkpoints");
         cpConfig.setMinPauseBetweenCheckpoints(10000); // Уменьшено для более частых checkpoint
         cpConfig.setCheckpointTimeout(600000);
         cpConfig.setMaxConcurrentCheckpoints(1);
@@ -140,7 +140,7 @@ public class FirebirdToIcebergJob {
             CheckpointConfig.ExternalizedCheckpointCleanup.RETAIN_ON_CANCELLATION
         );
 
-        System.out.println("Checkpointing: EXACTLY_ONCE, interval=60s, storage=s3://rzdm-prod-technical-area/flink/checkpoints");
+        System.out.println("Checkpointing: EXACTLY_ONCE, interval=60s, storage=s3://rzdm-test-technical-area/flink/checkpoints");
 
         StreamTableEnvironment tableEnv = StreamTableEnvironment.create(env);
 
@@ -289,7 +289,7 @@ public class FirebirdToIcebergJob {
                 // Настройка чекпоинтов для нового окружения
                 env.enableCheckpointing(60000, CheckpointingMode.EXACTLY_ONCE);
                 CheckpointConfig cpConfigBatch = env.getCheckpointConfig();
-                cpConfigBatch.setCheckpointStorage("s3://rzdm-prod-technical-area/flink/checkpoints");
+                cpConfigBatch.setCheckpointStorage("s3://rzdm-test-technical-area/flink/checkpoints");
                 cpConfigBatch.setMinPauseBetweenCheckpoints(10000);
                 cpConfigBatch.setCheckpointTimeout(600000);
                 cpConfigBatch.setMaxConcurrentCheckpoints(1);
