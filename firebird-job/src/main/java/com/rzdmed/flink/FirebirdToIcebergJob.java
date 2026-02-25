@@ -106,6 +106,9 @@ public class FirebirdToIcebergJob {
         int parallelism    = Integer.parseInt(getArg(args, "--parallelism", String.valueOf(DEFAULT_PARALLELISM)));
         int fetchSize      = Integer.parseInt(getArg(args, "--fetch-size", String.valueOf(DEFAULT_FETCH_SIZE)));
         int batchSize      = Integer.parseInt(getArg(args, "--batch-size", String.valueOf(DEFAULT_BATCH_SIZE)));
+        boolean failOnConsistencyError = Boolean.parseBoolean(
+            getArg(args, "--fail-on-consistency-error", "false")
+        );
 
         // 2. Строим список пар таблиц Firebird → Iceberg
         List<TableMapping> tableMappings = parseTableMappings(singleTable, tablesArg);
@@ -129,6 +132,7 @@ public class FirebirdToIcebergJob {
         System.out.println("Parallelism    : " + parallelism);
         System.out.println("Fetch size     : " + fetchSize);
         System.out.println("Batch size     : " + batchSize + " tables per job");
+        System.out.println("Fail on consistency error: " + failOnConsistencyError);
 
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
         env.setParallelism(parallelism);
@@ -269,9 +273,65 @@ public class FirebirdToIcebergJob {
                     TableResult result = stmtSet.execute();
                     result.await();
                     System.out.println("=== Batch " + batchNumber + " completed successfully ===");
-                    runConsistencyChecks(tableEnv, fbUrl, fbUser, fbPass, icebergDb, loadedTables);
                 } catch (Exception e) {
                     System.err.println("ERROR: Batch " + batchNumber + " failed: " + e.getMessage());
+                    System.err.println("Continuing with next batch...");
+                    processedTables = batchEnd;
+                    batchNumber++;
+                    if (processedTables < totalTables) {
+                        System.out.println();
+                        System.out.println("Preparing next batch...");
+                        env = StreamExecutionEnvironment.getExecutionEnvironment();
+                        env.setParallelism(parallelism);
+                        
+                        // Настройка S3 файловой системы для checkpoint storage
+                        System.setProperty("fs.s3a.access.key", S3_ACCESS_KEY);
+                        System.setProperty("fs.s3a.secret.key", S3_SECRET_KEY);
+                        System.setProperty("fs.s3a.endpoint", S3_ENDPOINT);
+                        System.setProperty("fs.s3a.path.style.access", "true");
+                        System.setProperty("fs.s3a.connection.ssl.enabled", "false");
+                        System.setProperty("fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem");
+                        
+                        // Настройка чекпоинтов для нового окружения
+                        env.enableCheckpointing(60000, CheckpointingMode.EXACTLY_ONCE);
+                        CheckpointConfig cpConfigBatch = env.getCheckpointConfig();
+                        cpConfigBatch.setCheckpointStorage(FLINK_CHECKPOINTS_PATH);
+                        cpConfigBatch.setMinPauseBetweenCheckpoints(10000);
+                        cpConfigBatch.setCheckpointTimeout(600000);
+                        cpConfigBatch.setMaxConcurrentCheckpoints(1);
+                        cpConfigBatch.setTolerableCheckpointFailureNumber(3);
+                        cpConfigBatch.setExternalizedCheckpointCleanup(
+                            CheckpointConfig.ExternalizedCheckpointCleanup.RETAIN_ON_CANCELLATION
+                        );
+                        
+                        tableEnv = StreamTableEnvironment.create(env);
+                        
+                        // Пересоздаём Iceberg каталог для нового окружения
+                        tableEnv.executeSql(
+                            "CREATE CATALOG iceberg WITH (" +
+                            "  'type' = 'iceberg'," +
+                            "  'catalog-impl' = 'org.apache.iceberg.rest.RESTCatalog'," +
+                            "  'uri' = '" + ICEBERG_CATALOG_URI + "'," +
+                            "  'warehouse' = '" + ICEBERG_WAREHOUSE + "'," +
+                            "  'io-impl' = 'org.apache.iceberg.aws.s3.S3FileIO'," +
+                            "  's3.endpoint' = '" + S3_ENDPOINT + "'," +
+                            "  's3.path-style-access' = 'true'," +
+                            "  'client.region' = '" + S3_REGION + "'," +
+                            "  's3.access-key-id' = '" + S3_ACCESS_KEY + "'," +
+                            "  's3.secret-access-key' = '" + S3_SECRET_KEY + "'" +
+                            ")"
+                        );
+                    }
+                    continue;
+                }
+
+                try {
+                    runConsistencyChecks(tableEnv, fbUrl, fbUser, fbPass, icebergDb, loadedTables);
+                } catch (ConsistencyCheckException e) {
+                    System.err.println("ERROR: Consistency check failed for batch " + batchNumber + ": " + e.getMessage());
+                    if (failOnConsistencyError) {
+                        throw e;
+                    }
                     System.err.println("Continuing with next batch...");
                 }
             }
@@ -1017,6 +1077,52 @@ public class FirebirdToIcebergJob {
         }
     }
 
+    static class ConsistencyCheckException extends RuntimeException {
+        ConsistencyCheckException(String message) {
+            super(message);
+        }
+    }
+
+    /**
+     * Коммутативный агрегатор хэшей строк (устойчив к порядку строк).
+     * Нужен, чтобы в стриминговом режиме не делать ORDER BY всей таблицы.
+    */
+    static class RowHashAccumulator {
+        long sumA = 0L;
+        long sumB = 0L;
+        long xorA = 0L;
+        long xorB = 0L;
+
+        void addRowHash(String rowHashHex64) {
+            if (rowHashHex64 == null || rowHashHex64.length() < 32) {
+                throw new IllegalArgumentException("Invalid row hash: " + rowHashHex64);
+            }
+            long partA = Long.parseUnsignedLong(rowHashHex64.substring(0, 16), 16);
+            long partB = Long.parseUnsignedLong(rowHashHex64.substring(16, 32), 16);
+
+            sumA += partA;
+            sumB += partB;
+            xorA ^= partA;
+            xorB ^= partB;
+        }
+
+        String digest() {
+            try {
+                MessageDigest md = MessageDigest.getInstance("SHA-256");
+                md.update(Long.toHexString(sumA).getBytes(StandardCharsets.UTF_8));
+                md.update((byte) '|');
+                md.update(Long.toHexString(sumB).getBytes(StandardCharsets.UTF_8));
+                md.update((byte) '|');
+                md.update(Long.toHexString(xorA).getBytes(StandardCharsets.UTF_8));
+                md.update((byte) '|');
+                md.update(Long.toHexString(xorB).getBytes(StandardCharsets.UTF_8));
+                return bytesToHex(md.digest());
+            } catch (Exception e) {
+                throw new RuntimeException("Failed to finalize aggregated hash", e);
+            }
+        }
+    }
+
     static void runConsistencyChecks(StreamTableEnvironment tableEnv,
                                      String fbUrl,
                                      String fbUser,
@@ -1044,7 +1150,7 @@ public class FirebirdToIcebergJob {
                     + " | Firebird(rows=" + fb.rowCount + ", hash=" + fb.hash + ")"
                     + " vs Iceberg(rows=" + ib.rowCount + ", hash=" + ib.hash + ")";
                 System.err.println("  ERROR: " + error);
-                throw new RuntimeException(error);
+                throw new ConsistencyCheckException(error);
             }
         }
     }
@@ -1060,21 +1166,18 @@ public class FirebirdToIcebergJob {
         Class.forName("org.firebirdsql.jdbc.FBDriver");
 
         StringBuilder selectList = new StringBuilder();
-        StringBuilder orderByList = new StringBuilder();
         for (int i = 0; i < columns.size(); i++) {
             if (i > 0) {
                 selectList.append(", ");
-                orderByList.append(", ");
             }
             String colUpper = columns.get(i).name.toUpperCase();
             selectList.append(colUpper);
-            orderByList.append(colUpper);
         }
 
-        String query = "SELECT " + selectList + " FROM " + tableName + " ORDER BY " + orderByList;
+        String query = "SELECT " + selectList + " FROM " + tableName;
 
         long rows = 0;
-        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+        RowHashAccumulator accumulator = new RowHashAccumulator();
 
         try (Connection conn = DriverManager.getConnection(url, props);
              Statement stmt = conn.createStatement();
@@ -1085,52 +1188,40 @@ public class FirebirdToIcebergJob {
                     values[i] = readColumnValue(rs, i + 1, columns.get(i).jdbcType);
                 }
                 String rowHash = computeRowHash(values);
-                digest.update(rowHash.getBytes(StandardCharsets.UTF_8));
-                digest.update((byte) '\n');
+                accumulator.addRowHash(rowHash);
                 rows++;
             }
         }
 
-        return new TableHashResult(rows, bytesToHex(digest.digest()));
+        return new TableHashResult(rows, accumulator.digest());
     }
 
     static TableHashResult computeIcebergTableHash(StreamTableEnvironment tableEnv,
                                                    String icebergDb,
                                                    String icebergTable,
                                                    List<ColumnInfo> columns) throws Exception {
-        StringBuilder selectList = new StringBuilder();
-        StringBuilder orderByList = new StringBuilder();
-        for (int i = 0; i < columns.size(); i++) {
-            if (i > 0) {
-                selectList.append(", ");
-                orderByList.append(", ");
-            }
-            String col = escapeColumnName(columns.get(i).name);
-            selectList.append(col);
-            orderByList.append(col);
-        }
+        String[] techNames = resolveTechColumnNames(columns);
+        String techRowHashName = techNames[techNames.length - 1];
 
-        String sql = "SELECT " + selectList + " FROM iceberg." + icebergDb + ".`" + icebergTable
-            + "` ORDER BY " + orderByList;
+        String sql = "SELECT " + escapeColumnName(techRowHashName)
+            + " FROM iceberg." + icebergDb + ".`" + icebergTable + "`";
 
         long rows = 0;
-        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+        RowHashAccumulator accumulator = new RowHashAccumulator();
         TableResult result = tableEnv.executeSql(sql);
         try (CloseableIterator<Row> it = result.collect()) {
             while (it.hasNext()) {
                 Row row = it.next();
-                Object[] values = new Object[columns.size()];
-                for (int i = 0; i < columns.size(); i++) {
-                    values[i] = row.getField(i);
+                Object rowHashObj = row.getField(0);
+                if (rowHashObj == null) {
+                    throw new IllegalStateException("Found NULL row_hash in Iceberg table " + icebergTable);
                 }
-                String rowHash = computeRowHash(values);
-                digest.update(rowHash.getBytes(StandardCharsets.UTF_8));
-                digest.update((byte) '\n');
+                accumulator.addRowHash(rowHashObj.toString());
                 rows++;
             }
         }
 
-        return new TableHashResult(rows, bytesToHex(digest.digest()));
+        return new TableHashResult(rows, accumulator.digest());
     }
 
     static Object readColumnValue(ResultSet rs, int colIndex, int jdbcType) throws SQLException {
