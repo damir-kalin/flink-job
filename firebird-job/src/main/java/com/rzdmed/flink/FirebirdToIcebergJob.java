@@ -63,9 +63,9 @@ import java.util.Properties;
 public class FirebirdToIcebergJob {
 
     // === Defaults ===
-    private static final String DEFAULT_FB_URL = "jdbc:firebirdsql://10.216.1.229:3050/esud_99099";
-    private static final String DEFAULT_FB_USER = "BI_USER";
-    private static final String DEFAULT_FB_PASS = "bi_user_pass";
+    private static final String DEFAULT_FB_URL = "jdbc:firebirdsql://firebird:3050//firebird/data/testdb.fdb";
+    private static final String DEFAULT_FB_USER = "SYSDBA";
+    private static final String DEFAULT_FB_PASS = "Q1w2e3r+";
     private static final String DEFAULT_ICEBERG_DB = "rzdm__mis";
     private static final String DEFAULT_MODE = "append";
     private static final int DEFAULT_PARALLELISM = 8;
@@ -79,11 +79,11 @@ public class FirebirdToIcebergJob {
 
     // === Iceberg catalog settings ===
     private static final String ICEBERG_CATALOG_URI = "http://iceberg-rest:8181";
-    private static final String ICEBERG_WAREHOUSE = "s3://rzdm-prod-data-lake/";
-    private static final String S3_ENDPOINT = "https://hb.ru-msk.vkcloud-storage.ru";
+    private static final String ICEBERG_WAREHOUSE = "s3://iceberg/";
+    private static final String S3_ENDPOINT = "http://minio-svc:9000";
     private static final String S3_REGION = "ru-central1";
-    private static final String S3_ACCESS_KEY = "t2n4fuSzpZuPEDT2BWz4jP";
-    private static final String S3_SECRET_KEY = "bREkNH2YMAK8afqKFbvjrYX9ktEJkmwfm2hP2YJV8pqh";
+    private static final String S3_ACCESS_KEY = "minioadmin";
+    private static final String S3_SECRET_KEY = "Q1w2e3r+";
 
     // ======================================================================
 
@@ -177,6 +177,7 @@ public class FirebirdToIcebergJob {
             
             // Создаём новый StatementSet для каждого батча
             StatementSet stmtSet = tableEnv.createStatementSet();
+            int tablesAdded = 0;
 
             for (TableMapping tm : currentBatch) {
             System.out.println();
@@ -248,19 +249,23 @@ public class FirebirdToIcebergJob {
                               + " SELECT * FROM " + viewName;
             System.out.println("  Insert SQL: " + insertSql);
                 stmtSet.addInsertSql(insertSql);
+                tablesAdded++;
             }
 
             // 6. Выполняем текущий батч как отдельный Flink job
             System.out.println();
-            System.out.println("=== Executing batch " + batchNumber + ": " + currentBatch.size() + " table(s) ===");
-
-            TableResult result = stmtSet.execute();
-            try {
-                result.await();
-                System.out.println("=== Batch " + batchNumber + " completed successfully ===");
-            } catch (Exception e) {
-                System.err.println("ERROR: Batch " + batchNumber + " failed: " + e.getMessage());
-                System.err.println("Continuing with next batch...");
+            if (tablesAdded == 0) {
+                System.out.println("=== Batch " + batchNumber + ": all tables skipped, nothing to execute ===");
+            } else {
+                System.out.println("=== Executing batch " + batchNumber + ": " + tablesAdded + " table(s) ===");
+                try {
+                    TableResult result = stmtSet.execute();
+                    result.await();
+                    System.out.println("=== Batch " + batchNumber + " completed successfully ===");
+                } catch (Exception e) {
+                    System.err.println("ERROR: Batch " + batchNumber + " failed: " + e.getMessage());
+                    System.err.println("Continuing with next batch...");
+                }
             }
 
             processedTables = batchEnd;
