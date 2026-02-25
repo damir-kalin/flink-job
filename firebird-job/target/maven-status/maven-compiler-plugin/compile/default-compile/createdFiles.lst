@@ -1,4 +1,6 @@
 com/rzdmed/flink/FirebirdToIcebergJob.class
+com/rzdmed/flink/FirebirdToIcebergJob$TableHashResult.class
+com/rzdmed/flink/FirebirdToIcebergJob$TableLoadContext.class
 com/rzdmed/flink/FirebirdToIcebergJob$ColumnInfo.class
 com/rzdmed/flink/FirebirdToIcebergJob$FirebirdDynamicSource.class
 com/rzdmed/flink/FirebirdToIcebergJob$TableMapping.class
