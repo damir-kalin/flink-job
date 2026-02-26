@@ -1154,8 +1154,8 @@ public class FirebirdToIcebergJob {
         Class.forName("org.firebirdsql.jdbc.FBDriver");
 
         String rowHashExpr = buildFirebirdRowHashExpression(columns);
-        String query = "SELECT COUNT(*), COALESCE(SUM(CAST(ROW_HASH AS DECIMAL(38, 0))), CAST(0 AS DECIMAL(38, 0))) "
-            + "FROM (SELECT " + rowHashExpr + " AS ROW_HASH FROM " + tableName
+        String query = "SELECT COUNT(*), COALESCE(SUM(ROW_HASH_DEC), CAST(0 AS DECIMAL(38, 0))) "
+            + "FROM (SELECT CAST(" + rowHashExpr + " AS DECIMAL(38, 0)) AS ROW_HASH_DEC FROM " + tableName
             + " ORDER BY " + orderByColumn + ")";
 
         try (Connection conn = DriverManager.getConnection(url, props);
