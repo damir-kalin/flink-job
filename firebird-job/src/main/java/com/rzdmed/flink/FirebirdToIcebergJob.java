@@ -27,11 +27,10 @@ import org.apache.flink.util.CloseableIterator;
 import org.apache.flink.table.api.StatementSet;
 
 import java.sql.*;
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
-import java.util.Base64;
+import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.util.List;
 import java.util.Properties;
 
@@ -90,7 +89,7 @@ public class FirebirdToIcebergJob {
     private static final String S3_REGION = "ru-central1";
     private static final String S3_ACCESS_KEY = "minioadmin";
     private static final String S3_SECRET_KEY = "Q1w2e3r+";
-    private static final String FLINK_CHECKPOINTS_PATH = "s3://rzdm-test-technical-area/flink/checkpoints";
+    private static final String FLINK_CHECKPOINTS_PATH = "s3://flink/checkpoints";
 
     // ======================================================================
 
@@ -478,8 +477,8 @@ public class FirebirdToIcebergJob {
             Class.forName("org.firebirdsql.jdbc.FBDriver");
             try (Connection conn = DriverManager.getConnection(url, props);
                  Statement stmt = conn.createStatement()) {
-                // Пробуем выполнить простой SELECT с LIMIT 1
-                String testQuery = "SELECT 1 FROM " + tableName + " ROWS 1";
+                // Пробуем выполнить простой SELECT с LIMIT 1 (Firebird: FIRST 1)
+                String testQuery = "SELECT FIRST 1 1 FROM " + tableName;
                 stmt.executeQuery(testQuery);
                 return true;
             }
@@ -764,7 +763,7 @@ public class FirebirdToIcebergJob {
             sb.append(escapeColumnName(columns.get(i).name)).append(" ").append(columns.get(i).icebergType);
         }
         // Технические поля (имена зависят от наличия конфликтов)
-        String[] techTypes = {"TIMESTAMP NOT NULL", "TIMESTAMP", "BIGINT", "STRING", "BIGINT", "BIGINT", "STRING", "TIMESTAMP", "TIMESTAMP", "STRING"};
+        String[] techTypes = {"TIMESTAMP NOT NULL", "TIMESTAMP", "BIGINT", "STRING", "BIGINT", "BIGINT", "STRING", "TIMESTAMP", "TIMESTAMP", "BIGINT"};
         for (int i = 0; i < techNames.length; i++) {
             sb.append(", ").append(escapeColumnName(techNames[i])).append(" ").append(techTypes[i]);
         }
@@ -792,7 +791,7 @@ public class FirebirdToIcebergJob {
         TypeInformation<?>[] techTypes = {
             Types.LOCAL_DATE_TIME, Types.LOCAL_DATE_TIME, Types.LONG,
             Types.STRING, Types.LONG, Types.LONG,
-            Types.STRING, Types.LOCAL_DATE_TIME, Types.LOCAL_DATE_TIME, Types.STRING
+            Types.STRING, Types.LOCAL_DATE_TIME, Types.LOCAL_DATE_TIME, Types.LONG
         };
         int o = columns.size();
         for (int i = 0; i < techNames.length; i++) {
@@ -818,7 +817,7 @@ public class FirebirdToIcebergJob {
             DataTypes.BIGINT().nullable(), DataTypes.STRING().nullable(),
             DataTypes.BIGINT().nullable(), DataTypes.BIGINT().nullable(),
             DataTypes.STRING().nullable(), DataTypes.TIMESTAMP(6).nullable(),
-            DataTypes.TIMESTAMP(6).nullable(), DataTypes.STRING().nullable()
+            DataTypes.TIMESTAMP(6).nullable(), DataTypes.BIGINT().nullable()
         };
         for (int i = 0; i < techNames.length; i++) {
             builder.column(techNames[i], techDataTypes[i]);
@@ -917,6 +916,7 @@ public class FirebirdToIcebergJob {
                 if (i > 0) query.append(", ");
                 query.append(columns.get(i).name.toUpperCase());
             }
+            query.append(", ").append(buildFirebirdRowHashExpression(columns)).append(" AS ROW_HASH");
             query.append(" FROM ").append(tableName);
             query.append(" ORDER BY ").append(orderByColumn);
 
@@ -933,11 +933,9 @@ public class FirebirdToIcebergJob {
                     int srcCols = columns.size();
                     while (rs.next() && running) {
                         Row row = new Row(srcCols + TECH_COLS_COUNT);
-                        Object[] sourceValues = new Object[srcCols];
                         // Исходные столбцы из Firebird
                         for (int i = 0; i < srcCols; i++) {
                             Object value = readColumn(rs, i + 1, columns.get(i).jdbcType);
-                            sourceValues[i] = value;
                             row.setField(i, value);
                         }
                         // Технические поля
@@ -951,7 +949,7 @@ public class FirebirdToIcebergJob {
                         row.setField(o + 6, "mis");                // src_system_code
                         row.setField(o + 7, null);                 // extract_dttm
                         row.setField(o + 8, null);                 // src_chng_dttm
-                        row.setField(o + 9, computeRowHash(sourceValues)); // row_hash
+                        row.setField(o + 9, rs.getLong(srcCols + 1)); // row_hash (рассчитан в Firebird)
 
                         // Атомарно: emit + increment offset (под checkpoint lock)
                         synchronized (lock) {
@@ -1071,57 +1069,17 @@ public class FirebirdToIcebergJob {
 
     static class TableHashResult {
         final long rowCount;
-        final String hash;
+        final BigInteger hashSum;
 
-        TableHashResult(long rowCount, String hash) {
+        TableHashResult(long rowCount, BigInteger hashSum) {
             this.rowCount = rowCount;
-            this.hash = hash;
+            this.hashSum = hashSum;
         }
     }
 
     static class ConsistencyCheckException extends RuntimeException {
         ConsistencyCheckException(String message) {
             super(message);
-        }
-    }
-
-    /**
-     * Коммутативный агрегатор хэшей строк (устойчив к порядку строк).
-     * Нужен, чтобы в стриминговом режиме не делать ORDER BY всей таблицы.
-    */
-    static class RowHashAccumulator {
-        long sumA = 0L;
-        long sumB = 0L;
-        long xorA = 0L;
-        long xorB = 0L;
-
-        void addRowHash(String rowHashHex64) {
-            if (rowHashHex64 == null || rowHashHex64.length() < 32) {
-                throw new IllegalArgumentException("Invalid row hash: " + rowHashHex64);
-            }
-            long partA = Long.parseUnsignedLong(rowHashHex64.substring(0, 16), 16);
-            long partB = Long.parseUnsignedLong(rowHashHex64.substring(16, 32), 16);
-
-            sumA += partA;
-            sumB += partB;
-            xorA ^= partA;
-            xorB ^= partB;
-        }
-
-        String digest() {
-            try {
-                MessageDigest md = MessageDigest.getInstance("SHA-256");
-                md.update(Long.toHexString(sumA).getBytes(StandardCharsets.UTF_8));
-                md.update((byte) '|');
-                md.update(Long.toHexString(sumB).getBytes(StandardCharsets.UTF_8));
-                md.update((byte) '|');
-                md.update(Long.toHexString(xorA).getBytes(StandardCharsets.UTF_8));
-                md.update((byte) '|');
-                md.update(Long.toHexString(xorB).getBytes(StandardCharsets.UTF_8));
-                return bytesToHex(md.digest());
-            } catch (Exception e) {
-                throw new RuntimeException("Failed to finalize aggregated hash", e);
-            }
         }
     }
 
@@ -1141,19 +1099,21 @@ public class FirebirdToIcebergJob {
         System.out.println();
         System.out.println("=== Consistency check (Firebird vs Iceberg) ===");
         for (TableLoadContext ctx : loadedTables) {
-            TableHashResult fb = computeFirebirdTableHash(fbUrl, fbUser, fbPass, ctx.mapping.fbTable, ctx.columns);
+            TableHashResult fb = computeFirebirdTableHash(
+                fbUrl, fbUser, fbPass, ctx.mapping.fbTable, ctx.columns, ctx.orderByColumn
+            );
             TableHashResult ib = computeIcebergTableHash(batchTableEnv, icebergDb, ctx.mapping.icebergTable, ctx.columns);
 
             boolean countMatch = fb.rowCount == ib.rowCount;
-            boolean hashMatch = fb.hash.equals(ib.hash);
+            boolean hashMatch = fb.hashSum.equals(ib.hashSum);
             if (countMatch && hashMatch) {
                 System.out.println("  OK: " + ctx.mapping.fbTable + " -> " + ctx.mapping.icebergTable
-                    + " (rows=" + fb.rowCount + ", hash=" + fb.hash + ")");
+                    + " (rows=" + fb.rowCount + ", hash_sum=" + fb.hashSum + ")");
             } else {
                 String error = "CONSISTENCY CHECK FAILED for table " + ctx.mapping.fbTable
                     + " -> " + ctx.mapping.icebergTable
-                    + " | Firebird(rows=" + fb.rowCount + ", hash=" + fb.hash + ")"
-                    + " vs Iceberg(rows=" + ib.rowCount + ", hash=" + ib.hash + ")";
+                    + " | Firebird(rows=" + fb.rowCount + ", hash_sum=" + fb.hashSum + ")"
+                    + " vs Iceberg(rows=" + ib.rowCount + ", hash_sum=" + ib.hashSum + ")";
                 System.err.println("  ERROR: " + error);
                 throw new ConsistencyCheckException(error);
             }
@@ -1182,7 +1142,9 @@ public class FirebirdToIcebergJob {
     }
 
     static TableHashResult computeFirebirdTableHash(String url, String user, String pass,
-                                                    String tableName, List<ColumnInfo> columns) throws Exception {
+                                                    String tableName,
+                                                    List<ColumnInfo> columns,
+                                                    String orderByColumn) throws Exception {
         Properties props = new Properties();
         props.setProperty("user", user);
         props.setProperty("password", pass);
@@ -1191,35 +1153,21 @@ public class FirebirdToIcebergJob {
 
         Class.forName("org.firebirdsql.jdbc.FBDriver");
 
-        StringBuilder selectList = new StringBuilder();
-        for (int i = 0; i < columns.size(); i++) {
-            if (i > 0) {
-                selectList.append(", ");
-            }
-            String colUpper = columns.get(i).name.toUpperCase();
-            selectList.append(colUpper);
-        }
-
-        String query = "SELECT " + selectList + " FROM " + tableName;
-
-        long rows = 0;
-        RowHashAccumulator accumulator = new RowHashAccumulator();
+        String rowHashExpr = buildFirebirdRowHashExpression(columns);
+        String query = "SELECT COUNT(*), COALESCE(SUM(CAST(ROW_HASH AS DECIMAL(38, 0))), CAST(0 AS DECIMAL(38, 0))) "
+            + "FROM (SELECT " + rowHashExpr + " AS ROW_HASH FROM " + tableName
+            + " ORDER BY " + orderByColumn + ")";
 
         try (Connection conn = DriverManager.getConnection(url, props);
              Statement stmt = conn.createStatement();
              ResultSet rs = stmt.executeQuery(query)) {
-            while (rs.next()) {
-                Object[] values = new Object[columns.size()];
-                for (int i = 0; i < columns.size(); i++) {
-                    values[i] = readColumnValue(rs, i + 1, columns.get(i).jdbcType);
-                }
-                String rowHash = computeRowHash(values);
-                accumulator.addRowHash(rowHash);
-                rows++;
+            if (!rs.next()) {
+                return new TableHashResult(0L, BigInteger.ZERO);
             }
+            long count = rs.getLong(1);
+            BigDecimal sum = rs.getBigDecimal(2);
+            return new TableHashResult(count, sum != null ? sum.toBigInteger() : BigInteger.ZERO);
         }
-
-        return new TableHashResult(rows, accumulator.digest());
     }
 
     static TableHashResult computeIcebergTableHash(TableEnvironment tableEnv,
@@ -1227,117 +1175,38 @@ public class FirebirdToIcebergJob {
                                                    String icebergTable,
                                                    List<ColumnInfo> columns) throws Exception {
         String[] techNames = resolveTechColumnNames(columns);
-        String techRowHashName = techNames[techNames.length - 1];
+        String rowHashCol = techNames[techNames.length - 1];
 
-        String sql = "SELECT " + escapeColumnName(techRowHashName)
-            + " FROM iceberg." + icebergDb + ".`" + icebergTable + "`";
+        String sql = "SELECT COUNT(*), COALESCE(SUM(CAST(" + escapeColumnName(rowHashCol) + " AS DECIMAL(38, 0))), CAST(0 AS DECIMAL(38, 0))) "
+            + "FROM iceberg." + icebergDb + ".`" + icebergTable + "`";
 
-        long rows = 0;
-        RowHashAccumulator accumulator = new RowHashAccumulator();
         TableResult result = tableEnv.executeSql(sql);
         try (CloseableIterator<Row> it = result.collect()) {
-            while (it.hasNext()) {
-                Row row = it.next();
-                Object rowHashObj = row.getField(0);
-                if (rowHashObj == null) {
-                    throw new IllegalStateException("Found NULL row_hash in Iceberg table " + icebergTable);
-                }
-                accumulator.addRowHash(rowHashObj.toString());
-                rows++;
+            if (!it.hasNext()) {
+                return new TableHashResult(0L, BigInteger.ZERO);
             }
+            Row row = it.next();
+            long count = ((Number) row.getField(0)).longValue();
+            BigDecimal sum = (BigDecimal) row.getField(1);
+            return new TableHashResult(count, sum != null ? sum.toBigInteger() : BigInteger.ZERO);
         }
-
-        return new TableHashResult(rows, accumulator.digest());
     }
 
-    static Object readColumnValue(ResultSet rs, int colIndex, int jdbcType) throws SQLException {
-        Object value;
-        switch (jdbcType) {
-            case java.sql.Types.BIT:
-            case java.sql.Types.BOOLEAN:
-                value = rs.getBoolean(colIndex);
-                break;
-            case java.sql.Types.TINYINT:
-            case java.sql.Types.SMALLINT:
-                value = rs.getShort(colIndex);
-                break;
-            case java.sql.Types.INTEGER:
-                value = rs.getInt(colIndex);
-                break;
-            case java.sql.Types.BIGINT:
-                value = rs.getLong(colIndex);
-                break;
-            case java.sql.Types.FLOAT:
-            case java.sql.Types.REAL:
-                value = rs.getFloat(colIndex);
-                break;
-            case java.sql.Types.DOUBLE:
-                value = rs.getDouble(colIndex);
-                break;
-            case java.sql.Types.NUMERIC:
-            case java.sql.Types.DECIMAL:
-                value = rs.getBigDecimal(colIndex);
-                break;
-            case java.sql.Types.DATE:
-                Date d = rs.getDate(colIndex);
-                value = d != null ? d.toLocalDate() : null;
-                break;
-            case java.sql.Types.TIME:
-            case java.sql.Types.TIME_WITH_TIMEZONE:
-                Time t = rs.getTime(colIndex);
-                value = t != null ? t.toLocalTime() : null;
-                break;
-            case java.sql.Types.TIMESTAMP:
-            case java.sql.Types.TIMESTAMP_WITH_TIMEZONE:
-                Timestamp ts = rs.getTimestamp(colIndex);
-                value = ts != null ? ts.toLocalDateTime() : null;
-                break;
-            case java.sql.Types.BINARY:
-            case java.sql.Types.VARBINARY:
-            case java.sql.Types.LONGVARBINARY:
-            case java.sql.Types.BLOB:
-                value = rs.getBytes(colIndex);
-                break;
-            default:
-                value = rs.getString(colIndex);
-                break;
-        }
-        if (rs.wasNull()) {
-            value = null;
-        }
-        return value;
-    }
-
-    static String computeRowHash(Object[] values) {
-        try {
-            MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            for (Object value : values) {
-                String serialized;
-                if (value == null) {
-                    serialized = "<NULL>";
-                } else if (value instanceof byte[]) {
-                    serialized = "BYTES:" + Base64.getEncoder().encodeToString((byte[]) value);
-                } else {
-                    serialized = value.getClass().getName() + ":" + value;
-                }
-                byte[] bytes = serialized.getBytes(StandardCharsets.UTF_8);
-                digest.update(Integer.toString(bytes.length).getBytes(StandardCharsets.UTF_8));
-                digest.update((byte) ':');
-                digest.update(bytes);
-                digest.update((byte) '|');
+    /**
+     * Строит Firebird SQL-выражение для row hash.
+     * Используем VARCHAR(1000) на столбец — Firebird ограничивает размер строки 64KB,
+     * VARCHAR(32765) на несколько столбцов вызывает "Implementation limit exceeded; COLUMN".
+     */
+    static String buildFirebirdRowHashExpression(List<ColumnInfo> columns) {
+        StringBuilder concat = new StringBuilder();
+        for (int i = 0; i < columns.size(); i++) {
+            if (i > 0) {
+                concat.append(" || '|' || ");
             }
-            return bytesToHex(digest.digest());
-        } catch (Exception e) {
-            throw new RuntimeException("Failed to compute row hash", e);
+            String col = columns.get(i).name.toUpperCase();
+            concat.append("COALESCE(CAST(").append(col).append(" AS VARCHAR(1000)), '<NULL>')");
         }
-    }
-
-    static String bytesToHex(byte[] bytes) {
-        StringBuilder sb = new StringBuilder(bytes.length * 2);
-        for (byte b : bytes) {
-            sb.append(String.format("%02x", b));
-        }
-        return sb.toString();
+        return "HASH(" + concat + ")";
     }
 
     // ======================================================================
