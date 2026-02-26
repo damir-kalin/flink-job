@@ -15,7 +15,9 @@ import org.apache.flink.streaming.api.environment.CheckpointConfig;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.functions.source.RichSourceFunction;
 import org.apache.flink.table.api.DataTypes;
+import org.apache.flink.table.api.EnvironmentSettings;
 import org.apache.flink.table.api.Schema;
+import org.apache.flink.table.api.TableEnvironment;
 import org.apache.flink.table.types.DataType;
 import org.apache.flink.table.api.TableResult;
 import org.apache.flink.table.api.bridge.java.StreamTableEnvironment;
@@ -326,7 +328,7 @@ public class FirebirdToIcebergJob {
                 }
 
                 try {
-                    runConsistencyChecks(tableEnv, fbUrl, fbUser, fbPass, icebergDb, loadedTables);
+                    runConsistencyChecks(fbUrl, fbUser, fbPass, icebergDb, loadedTables);
                 } catch (ConsistencyCheckException e) {
                     System.err.println("ERROR: Consistency check failed for batch " + batchNumber + ": " + e.getMessage());
                     if (failOnConsistencyError) {
@@ -1123,8 +1125,7 @@ public class FirebirdToIcebergJob {
         }
     }
 
-    static void runConsistencyChecks(StreamTableEnvironment tableEnv,
-                                     String fbUrl,
+    static void runConsistencyChecks(String fbUrl,
                                      String fbUser,
                                      String fbPass,
                                      String icebergDb,
@@ -1133,11 +1134,15 @@ public class FirebirdToIcebergJob {
             return;
         }
 
+        // Для проверки консистентности используем отдельный batch TableEnvironment,
+        // чтобы SELECT из Iceberg завершался конечным job и не "висел" как streaming query.
+        TableEnvironment batchTableEnv = createBatchTableEnvironmentForConsistency(icebergDb);
+
         System.out.println();
         System.out.println("=== Consistency check (Firebird vs Iceberg) ===");
         for (TableLoadContext ctx : loadedTables) {
             TableHashResult fb = computeFirebirdTableHash(fbUrl, fbUser, fbPass, ctx.mapping.fbTable, ctx.columns);
-            TableHashResult ib = computeIcebergTableHash(tableEnv, icebergDb, ctx.mapping.icebergTable, ctx.columns);
+            TableHashResult ib = computeIcebergTableHash(batchTableEnv, icebergDb, ctx.mapping.icebergTable, ctx.columns);
 
             boolean countMatch = fb.rowCount == ib.rowCount;
             boolean hashMatch = fb.hash.equals(ib.hash);
@@ -1153,6 +1158,27 @@ public class FirebirdToIcebergJob {
                 throw new ConsistencyCheckException(error);
             }
         }
+    }
+
+    static TableEnvironment createBatchTableEnvironmentForConsistency(String icebergDb) {
+        EnvironmentSettings settings = EnvironmentSettings.newInstance().inBatchMode().build();
+        TableEnvironment tEnv = TableEnvironment.create(settings);
+        tEnv.executeSql(
+            "CREATE CATALOG iceberg WITH (" +
+            "  'type' = 'iceberg'," +
+            "  'catalog-impl' = 'org.apache.iceberg.rest.RESTCatalog'," +
+            "  'uri' = '" + ICEBERG_CATALOG_URI + "'," +
+            "  'warehouse' = '" + ICEBERG_WAREHOUSE + "'," +
+            "  'io-impl' = 'org.apache.iceberg.aws.s3.S3FileIO'," +
+            "  's3.endpoint' = '" + S3_ENDPOINT + "'," +
+            "  's3.path-style-access' = 'true'," +
+            "  'client.region' = '" + S3_REGION + "'," +
+            "  's3.access-key-id' = '" + S3_ACCESS_KEY + "'," +
+            "  's3.secret-access-key' = '" + S3_SECRET_KEY + "'" +
+            ")"
+        );
+        tEnv.executeSql("CREATE DATABASE IF NOT EXISTS iceberg." + icebergDb);
+        return tEnv;
     }
 
     static TableHashResult computeFirebirdTableHash(String url, String user, String pass,
@@ -1196,7 +1222,7 @@ public class FirebirdToIcebergJob {
         return new TableHashResult(rows, accumulator.digest());
     }
 
-    static TableHashResult computeIcebergTableHash(StreamTableEnvironment tableEnv,
+    static TableHashResult computeIcebergTableHash(TableEnvironment tableEnv,
                                                    String icebergDb,
                                                    String icebergTable,
                                                    List<ColumnInfo> columns) throws Exception {
