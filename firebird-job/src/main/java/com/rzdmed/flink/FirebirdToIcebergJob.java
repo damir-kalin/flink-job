@@ -68,15 +68,15 @@ import java.util.Properties;
 public class FirebirdToIcebergJob {
 
     // === Defaults ===
-    private static final String DEFAULT_FB_URL = "jdbc:firebirdsql://10.216.1.229:3050/esud_99099";
-    private static final String DEFAULT_FB_USER = "BI_USER";
-    private static final String DEFAULT_FB_PASS = "bi_user_pass";
+    private static final String DEFAULT_FB_URL = "jdbc:firebirdsql://firebird:3050//firebird/data/testdb.fdb";
+    private static final String DEFAULT_FB_USER = "SYSDBA";
+    private static final String DEFAULT_FB_PASS = "Q1w2e3r+";
     private static final String DEFAULT_ICEBERG_DB = "rzdm__mis";
     private static final String DEFAULT_MODE = "append";
     private static final int DEFAULT_PARALLELISM = 8;
     private static final int DEFAULT_FETCH_SIZE = 50000;
     private static final int DEFAULT_BATCH_SIZE = 50;
-    private static final long HASH_SUM_MODULUS = 1000000007L;
+    private static final long HASH_SUM_MODULUS = 1000000007L; 
     private static final int TECH_COLS_COUNT = 10;
     private static final String[] TECH_COL_BASE_NAMES = {
         "load_dttm", "load_dttm_tz", "load_id", "op", "ts_ms",
@@ -85,12 +85,12 @@ public class FirebirdToIcebergJob {
 
     // === Iceberg catalog settings ===
     private static final String ICEBERG_CATALOG_URI = "http://iceberg-rest:8181";
-    private static final String ICEBERG_WAREHOUSE = "s3://rzdm-test-data-lake/";
-    private static final String S3_ENDPOINT = "https://hb.ru-msk.vkcloud-storage.ru";
+    private static final String ICEBERG_WAREHOUSE = "s3://iceberg/";
+    private static final String S3_ENDPOINT = "http://minio-svc:9000";
     private static final String S3_REGION = "ru-central1";
-    private static final String S3_ACCESS_KEY = "qBit7b7Aztj3gCnBkD2LFW";
-    private static final String S3_SECRET_KEY = "hSrwMWk9mmwue7UgrW6ptyoeYfXe7ugkUsabHTVSyyrJ";
-    private static final String FLINK_CHECKPOINTS_PATH = "s3://rzdm-test-technical-area/flink/checkpoints";
+    private static final String S3_ACCESS_KEY = "minioadmin";
+    private static final String S3_SECRET_KEY = "Q1w2e3r+";
+    private static final String FLINK_CHECKPOINTS_PATH = "s3://flink/checkpoints";
 
     // ======================================================================
 
@@ -1155,7 +1155,8 @@ public class FirebirdToIcebergJob {
         Class.forName("org.firebirdsql.jdbc.FBDriver");
 
         String rowHashExpr = buildFirebirdRowHashExpression(columns);
-        String rowHashNormExpr = "MOD(MOD(CAST(ROW_HASH AS DECIMAL(38, 0)), " + HASH_SUM_MODULUS + ") + " + HASH_SUM_MODULUS + ", " + HASH_SUM_MODULUS + ")";
+        String modDec = "CAST(" + HASH_SUM_MODULUS + " AS DECIMAL(38, 0))";
+        String rowHashNormExpr = "CAST(MOD(MOD(CAST(ROW_HASH AS DECIMAL(38, 0)), " + modDec + ") + " + modDec + ", " + modDec + ") AS DECIMAL(38, 0))";
         String query = "SELECT COUNT(*), COALESCE(SUM(ROW_HASH_DEC), CAST(0 AS DECIMAL(38, 0))) "
             + "FROM (SELECT " + rowHashNormExpr + " AS ROW_HASH_DEC "
             + "FROM (SELECT " + rowHashExpr + " AS ROW_HASH FROM " + tableName + " ORDER BY " + orderByColumn + ") src_hash"
@@ -1180,7 +1181,8 @@ public class FirebirdToIcebergJob {
         String[] techNames = resolveTechColumnNames(columns);
         String rowHashCol = techNames[techNames.length - 1];
 
-        String rowHashNormExpr = "MOD(MOD(CAST(" + escapeColumnName(rowHashCol) + " AS DECIMAL(38, 0)), " + HASH_SUM_MODULUS + ") + " + HASH_SUM_MODULUS + ", " + HASH_SUM_MODULUS + ")";
+        String modDec = "CAST(" + HASH_SUM_MODULUS + " AS DECIMAL(38, 0))";
+        String rowHashNormExpr = "CAST(MOD(MOD(CAST(" + escapeColumnName(rowHashCol) + " AS DECIMAL(38, 0)), " + modDec + ") + " + modDec + ", " + modDec + ") AS DECIMAL(38, 0))";
         String sql = "SELECT COUNT(*), COALESCE(SUM(" + rowHashNormExpr + "), CAST(0 AS DECIMAL(38, 0))) "
             + "FROM iceberg." + icebergDb + ".`" + icebergTable + "`";
 
