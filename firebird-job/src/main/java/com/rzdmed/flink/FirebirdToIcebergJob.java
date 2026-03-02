@@ -67,9 +67,9 @@ import java.util.Properties;
 public class FirebirdToIcebergJob {
 
     // === Defaults ===
-    private static final String DEFAULT_FB_URL = "jdbc:firebirdsql://firebird:3050//firebird/data/testdb.fdb";
-    private static final String DEFAULT_FB_USER = "SYSDBA";
-    private static final String DEFAULT_FB_PASS = "Q1w2e3r+";
+    private static final String DEFAULT_FB_URL = "jdbc:firebirdsql://10.216.1.229:3050/esud_99099";
+    private static final String DEFAULT_FB_USER = "BI_USER";
+    private static final String DEFAULT_FB_PASS = "bi_user_pass";
     private static final String DEFAULT_ICEBERG_DB = "rzdm__mis";
     private static final String DEFAULT_MODE = "append";
     private static final int DEFAULT_PARALLELISM = 8;
@@ -85,12 +85,12 @@ public class FirebirdToIcebergJob {
 
     // === Iceberg catalog settings ===
     private static final String ICEBERG_CATALOG_URI = "http://iceberg-rest:8181";
-    private static final String ICEBERG_WAREHOUSE = "s3://iceberg/";
-    private static final String S3_ENDPOINT = "http://minio-svc:9000";
+    private static final String ICEBERG_WAREHOUSE = "s3://rzdm-test-data-lake/";
+    private static final String S3_ENDPOINT = "https://hb.ru-msk.vkcloud-storage.ru";
     private static final String S3_REGION = "ru-central1";
-    private static final String S3_ACCESS_KEY = "minioadmin";
-    private static final String S3_SECRET_KEY = "Q1w2e3r+";
-    private static final String FLINK_CHECKPOINTS_PATH = "s3://flink/checkpoints";
+    private static final String S3_ACCESS_KEY = "qBit7b7Aztj3gCnBkD2LFW";
+    private static final String S3_SECRET_KEY = "hSrwMWk9mmwue7UgrW6ptyoeYfXe7ugkUsabHTVSyyrJ";
+    private static final String FLINK_CHECKPOINTS_PATH = "s3://rzdm-test-technical-area/flink/checkpoints";
 
     // ======================================================================
 
@@ -1437,11 +1437,30 @@ public class FirebirdToIcebergJob {
             if (i > 0) {
                 concat.append(" || '|' || ");
             }
-            concat.append("COALESCE(CAST(")
-                .append(escapeColumnName(columns.get(i).name))
-                .append(" AS STRING), '<NULL>')");
+            concat.append(buildIcebergHashValueExpression(columns.get(i)));
         }
         return "MD5(" + concat + ")";
+    }
+
+    /**
+     * Формируем строковое представление значения для hash в стиле Firebird:
+     * - null -> '<NULL>'
+     * - ограничение длины до 1000 символов (аналог CAST(... AS VARCHAR(1000)))
+     * - для TIMESTAMP фиксируем формат до миллисекунд
+     */
+    static String buildIcebergHashValueExpression(ColumnInfo column) {
+        String col = escapeColumnName(column.name);
+        String valueExpr;
+        switch (column.jdbcType) {
+            case java.sql.Types.TIMESTAMP:
+            case java.sql.Types.TIMESTAMP_WITH_TIMEZONE:
+                valueExpr = "DATE_FORMAT(CAST(" + col + " AS TIMESTAMP(3)), 'yyyy-MM-dd HH:mm:ss.SSS')";
+                break;
+            default:
+                valueExpr = "CAST(" + col + " AS STRING)";
+                break;
+        }
+        return "COALESCE(SUBSTRING(" + valueExpr + ", 1, 1000), '<NULL>')";
     }
 
     // ======================================================================
