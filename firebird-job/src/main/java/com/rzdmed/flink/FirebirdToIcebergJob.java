@@ -50,6 +50,8 @@ import java.util.Properties;
  *   --parallelism     N                    (по умолчанию: 8) уровень параллелизма для записи
  *   --fetch-size      N                    (по умолчанию: 50000) размер батча для чтения из Firebird
  *   --batch-size      N                    (по умолчанию: 50) количество таблиц в одном Flink job
+ *   --consistency-mode full|microbatch     (по умолчанию: full) режим проверки консистентности
+ *   --consistency-chunk-size N             (по умолчанию: 100000) размер диапазона PK в microbatch-режиме
  *
  * Примеры:
  *   # Одна таблица
@@ -107,9 +109,17 @@ public class FirebirdToIcebergJob {
         int parallelism    = Integer.parseInt(getArg(args, "--parallelism", String.valueOf(DEFAULT_PARALLELISM)));
         int fetchSize      = Integer.parseInt(getArg(args, "--fetch-size", String.valueOf(DEFAULT_FETCH_SIZE)));
         int batchSize      = Integer.parseInt(getArg(args, "--batch-size", String.valueOf(DEFAULT_BATCH_SIZE)));
+        String consistencyMode = getArg(args, "--consistency-mode", "full").toLowerCase(Locale.ROOT);
+        long consistencyChunkSize = Long.parseLong(getArg(args, "--consistency-chunk-size", "100000"));
         boolean failOnConsistencyError = Boolean.parseBoolean(
             getArg(args, "--fail-on-consistency-error", "false")
         );
+        if (!"full".equals(consistencyMode) && !"microbatch".equals(consistencyMode)) {
+            throw new IllegalArgumentException("--consistency-mode must be 'full' or 'microbatch'");
+        }
+        if (consistencyChunkSize <= 0) {
+            throw new IllegalArgumentException("--consistency-chunk-size must be > 0");
+        }
 
         // 2. Строим список пар таблиц Firebird → Iceberg
         List<TableMapping> tableMappings = parseTableMappings(singleTable, tablesArg);
@@ -133,6 +143,8 @@ public class FirebirdToIcebergJob {
         System.out.println("Parallelism    : " + parallelism);
         System.out.println("Fetch size     : " + fetchSize);
         System.out.println("Batch size     : " + batchSize + " tables per job");
+        System.out.println("Consistency mode: " + consistencyMode);
+        System.out.println("Consistency chunk size: " + consistencyChunkSize);
         System.out.println("Fail on consistency error: " + failOnConsistencyError);
 
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
@@ -277,7 +289,8 @@ public class FirebirdToIcebergJob {
                 stmtSet.addInsertSql(insertSql);
                 tablesAdded++;
                 loadedTables.add(new TableLoadContext(
-                    tm, columns, orderByColumn, firebirdWatermarkCondition, icebergWatermarkCondition
+                    tm, columns, orderByColumn, orderByInfo.jdbcType, orderByInfo.name,
+                    watermarkValue, firebirdWatermarkCondition, icebergWatermarkCondition
                 ));
             }
 
@@ -344,7 +357,9 @@ public class FirebirdToIcebergJob {
                 }
 
                 try {
-                    runConsistencyChecks(fbUrl, fbUser, fbPass, icebergDb, loadedTables);
+                    runConsistencyChecks(
+                        fbUrl, fbUser, fbPass, icebergDb, loadedTables, consistencyMode, consistencyChunkSize
+                    );
                 } catch (ConsistencyCheckException e) {
                     System.err.println("ERROR: Consistency check failed for batch " + batchNumber + ": " + e.getMessage());
                     if (failOnConsistencyError) {
@@ -646,6 +661,48 @@ public class FirebirdToIcebergJob {
             return "1 = 0";
         }
         return escapeColumnName(columnName) + " <= " + toSqlLiteral(watermarkValue, jdbcType, false);
+    }
+
+    static boolean isIntegralJdbcType(int jdbcType) {
+        return jdbcType == java.sql.Types.TINYINT
+            || jdbcType == java.sql.Types.SMALLINT
+            || jdbcType == java.sql.Types.INTEGER
+            || jdbcType == java.sql.Types.BIGINT;
+    }
+
+    static Long readFirebirdMinValue(String url, String user, String pass,
+                                     String tableName, String columnName,
+                                     String whereCondition) throws Exception {
+        Properties props = new Properties();
+        props.setProperty("user", user);
+        props.setProperty("password", pass);
+        props.setProperty("encoding", "UTF8");
+        props.setProperty("authPlugins", "Srp256,Srp,Legacy_Auth");
+
+        Class.forName("org.firebirdsql.jdbc.FBDriver");
+        String sql = "SELECT MIN(" + columnName + ") FROM " + tableName + " WHERE " + whereCondition;
+        try (Connection conn = DriverManager.getConnection(url, props);
+             Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery(sql)) {
+            if (!rs.next()) return null;
+            Object value = rs.getObject(1);
+            if (!(value instanceof Number)) return null;
+            return ((Number) value).longValue();
+        }
+    }
+
+    static String buildFirebirdRangeCondition(String columnName, long fromInclusive, long toInclusive) {
+        return columnName.toUpperCase() + " >= " + fromInclusive
+            + " AND " + columnName.toUpperCase() + " <= " + toInclusive;
+    }
+
+    static String buildIcebergRangeCondition(String columnName, long fromInclusive, long toInclusive) {
+        String escaped = escapeColumnName(columnName);
+        return escaped + " >= " + fromInclusive + " AND " + escaped + " <= " + toInclusive;
+    }
+
+    static String combineConditions(String left, String right) {
+        return "(" + left + ") AND (" + right + ")";
     }
 
     static String toSqlLiteral(Object value, int jdbcType, boolean firebirdDialect) {
@@ -1213,17 +1270,26 @@ public class FirebirdToIcebergJob {
         final TableMapping mapping;
         final List<ColumnInfo> columns;
         final String orderByColumn;
+        final int orderByJdbcType;
+        final String orderByIcebergColumn;
+        final Object watermarkValue;
         final String firebirdWatermarkCondition;
         final String icebergWatermarkCondition;
 
         TableLoadContext(TableMapping mapping,
                          List<ColumnInfo> columns,
                          String orderByColumn,
+                         int orderByJdbcType,
+                         String orderByIcebergColumn,
+                         Object watermarkValue,
                          String firebirdWatermarkCondition,
                          String icebergWatermarkCondition) {
             this.mapping = mapping;
             this.columns = columns;
             this.orderByColumn = orderByColumn;
+            this.orderByJdbcType = orderByJdbcType;
+            this.orderByIcebergColumn = orderByIcebergColumn;
+            this.watermarkValue = watermarkValue;
             this.firebirdWatermarkCondition = firebirdWatermarkCondition;
             this.icebergWatermarkCondition = icebergWatermarkCondition;
         }
@@ -1245,11 +1311,25 @@ public class FirebirdToIcebergJob {
         }
     }
 
+    static class ConsistencyCounters {
+        final long rowsRead;
+        final long rowsWritten;
+        final long hashMismatchCount;
+
+        ConsistencyCounters(long rowsRead, long rowsWritten, long hashMismatchCount) {
+            this.rowsRead = rowsRead;
+            this.rowsWritten = rowsWritten;
+            this.hashMismatchCount = hashMismatchCount;
+        }
+    }
+
     static void runConsistencyChecks(String fbUrl,
                                      String fbUser,
                                      String fbPass,
                                      String icebergDb,
-                                     List<TableLoadContext> loadedTables) throws Exception {
+                                     List<TableLoadContext> loadedTables,
+                                     String consistencyMode,
+                                     long consistencyChunkSize) throws Exception {
         if (loadedTables.isEmpty()) {
             return;
         }
@@ -1260,28 +1340,113 @@ public class FirebirdToIcebergJob {
 
         System.out.println();
         System.out.println("=== Consistency check (Firebird vs Iceberg) ===");
+        long totalRowsRead = 0L;
+        long totalRowsWritten = 0L;
         for (TableLoadContext ctx : loadedTables) {
+            ConsistencyCounters counters;
+            if ("microbatch".equals(consistencyMode) && isIntegralJdbcType(ctx.orderByJdbcType)) {
+                counters = runMicrobatchConsistencyCheck(
+                    fbUrl, fbUser, fbPass, batchTableEnv, icebergDb, ctx, consistencyChunkSize
+                );
+            } else {
+                if ("microbatch".equals(consistencyMode)) {
+                    System.out.println("  MICROBATCH fallback to FULL for " + ctx.mapping.fbTable
+                        + ": ORDER BY column type is not integral (jdbcType=" + ctx.orderByJdbcType + ")");
+                }
+                long firebirdCount = computeFirebirdTableCount(
+                    fbUrl, fbUser, fbPass, ctx.mapping.fbTable, ctx.firebirdWatermarkCondition
+                );
+                TableHashResult ib = computeIcebergTableHash(
+                    batchTableEnv, icebergDb, ctx.mapping.icebergTable, ctx.columns, ctx.icebergWatermarkCondition
+                );
+                counters = new ConsistencyCounters(firebirdCount, ib.rowCount, ib.hashMismatchCount);
+            }
+
+            totalRowsRead += counters.rowsRead;
+            totalRowsWritten += counters.rowsWritten;
+            long delta = counters.rowsRead - counters.rowsWritten;
+
+            System.out.println("  COUNTERS: " + ctx.mapping.fbTable + " -> " + ctx.mapping.icebergTable
+                + " | rows_read=" + counters.rowsRead
+                + ", rows_written=" + counters.rowsWritten
+                + ", delta=" + delta);
+
+            boolean countMatch = counters.rowsRead == counters.rowsWritten;
+            boolean hashMatch = counters.hashMismatchCount == 0;
+            if (countMatch && hashMatch) {
+                System.out.println("  OK: " + ctx.mapping.fbTable + " -> " + ctx.mapping.icebergTable
+                    + " (rows=" + counters.rowsWritten + ", hash_mismatch_count=0)");
+            } else {
+                String error = "CONSISTENCY CHECK FAILED for table " + ctx.mapping.fbTable
+                    + " -> " + ctx.mapping.icebergTable
+                    + " | Firebird(rows=" + counters.rowsRead + ")"
+                    + " vs Iceberg(rows=" + counters.rowsWritten
+                    + ", hash_mismatch_count=" + counters.hashMismatchCount + ")";
+                System.err.println("  ERROR: " + error);
+                throw new ConsistencyCheckException(error);
+            }
+        }
+        System.out.println("=== Batch counters: rows_read_total=" + totalRowsRead
+            + ", rows_written_total=" + totalRowsWritten
+            + ", delta_total=" + (totalRowsRead - totalRowsWritten) + " ===");
+    }
+
+    static ConsistencyCounters runMicrobatchConsistencyCheck(String fbUrl,
+                                                             String fbUser,
+                                                             String fbPass,
+                                                             TableEnvironment batchTableEnv,
+                                                             String icebergDb,
+                                                             TableLoadContext ctx,
+                                                             long chunkSize) throws Exception {
+        if (!(ctx.watermarkValue instanceof Number)) {
             long firebirdCount = computeFirebirdTableCount(
                 fbUrl, fbUser, fbPass, ctx.mapping.fbTable, ctx.firebirdWatermarkCondition
             );
             TableHashResult ib = computeIcebergTableHash(
                 batchTableEnv, icebergDb, ctx.mapping.icebergTable, ctx.columns, ctx.icebergWatermarkCondition
             );
-
-            boolean countMatch = firebirdCount == ib.rowCount;
-            boolean hashMatch = ib.hashMismatchCount == 0;
-            if (countMatch && hashMatch) {
-                System.out.println("  OK: " + ctx.mapping.fbTable + " -> " + ctx.mapping.icebergTable
-                    + " (rows=" + ib.rowCount + ", hash_mismatch_count=0)");
-            } else {
-                String error = "CONSISTENCY CHECK FAILED for table " + ctx.mapping.fbTable
-                    + " -> " + ctx.mapping.icebergTable
-                    + " | Firebird(rows=" + firebirdCount + ")"
-                    + " vs Iceberg(rows=" + ib.rowCount + ", hash_mismatch_count=" + ib.hashMismatchCount + ")";
-                System.err.println("  ERROR: " + error);
-                throw new ConsistencyCheckException(error);
-            }
+            return new ConsistencyCounters(firebirdCount, ib.rowCount, ib.hashMismatchCount);
         }
+
+        Long minValue = readFirebirdMinValue(
+            fbUrl, fbUser, fbPass, ctx.mapping.fbTable, ctx.orderByColumn, ctx.firebirdWatermarkCondition
+        );
+        if (minValue == null) {
+            return new ConsistencyCounters(0L, 0L, 0L);
+        }
+        long maxValue = ((Number) ctx.watermarkValue).longValue();
+        long from = minValue;
+        long totalRead = 0L;
+        long totalWritten = 0L;
+        long totalMismatch = 0L;
+        int chunkNo = 0;
+
+        while (from <= maxValue) {
+            long to = Math.min(from + chunkSize - 1, maxValue);
+            String fbRange = buildFirebirdRangeCondition(ctx.orderByColumn, from, to);
+            String ibRange = buildIcebergRangeCondition(ctx.orderByIcebergColumn, from, to);
+            String fbCondition = combineConditions(ctx.firebirdWatermarkCondition, fbRange);
+            String ibCondition = combineConditions(ctx.icebergWatermarkCondition, ibRange);
+
+            long firebirdCount = computeFirebirdTableCount(
+                fbUrl, fbUser, fbPass, ctx.mapping.fbTable, fbCondition
+            );
+            TableHashResult ib = computeIcebergTableHash(
+                batchTableEnv, icebergDb, ctx.mapping.icebergTable, ctx.columns, ibCondition
+            );
+
+            totalRead += firebirdCount;
+            totalWritten += ib.rowCount;
+            totalMismatch += ib.hashMismatchCount;
+            chunkNo++;
+
+            System.out.println("    microbatch#" + chunkNo + " range=[" + from + "," + to + "]"
+                + " rows_read=" + firebirdCount
+                + ", rows_written=" + ib.rowCount
+                + ", hash_mismatch_count=" + ib.hashMismatchCount);
+            from = to + 1;
+        }
+        return new ConsistencyCounters(totalRead, totalWritten, totalMismatch);
     }
 
     static TableEnvironment createBatchTableEnvironmentForConsistency(String icebergDb) {
