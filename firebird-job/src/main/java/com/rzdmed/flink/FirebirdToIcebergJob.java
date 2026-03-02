@@ -5,7 +5,6 @@ import org.apache.flink.api.common.state.ListStateDescriptor;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.api.common.typeinfo.Types;
 import org.apache.flink.api.java.typeutils.RowTypeInfo;
-import org.apache.flink.configuration.Configuration;
 import org.apache.flink.runtime.state.FunctionInitializationContext;
 import org.apache.flink.runtime.state.FunctionSnapshotContext;
 import org.apache.flink.streaming.api.CheckpointingMode;
@@ -28,9 +27,8 @@ import org.apache.flink.table.api.StatementSet;
 
 import java.sql.*;
 import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
-import java.math.BigDecimal;
-import java.math.BigInteger;
 import java.util.List;
 import java.util.Properties;
 
@@ -74,10 +72,10 @@ public class FirebirdToIcebergJob {
     private static final String DEFAULT_ICEBERG_DB = "rzdm__mis";
     private static final String DEFAULT_MODE = "append";
     private static final int DEFAULT_PARALLELISM = 8;
-    private static final int DEFAULT_FETCH_SIZE = 50000;
+    private static final int DEFAULT_FETCH_SIZE = 100000;
     private static final int DEFAULT_BATCH_SIZE = 50;
-    private static final long HASH_SUM_MODULUS = 1000000007L; 
     private static final int TECH_COLS_COUNT = 10;
+    private static final long ICEBERG_TARGET_FILE_SIZE_BYTES = 536870912L; // 512 MB
     private static final String[] TECH_COL_BASE_NAMES = {
         "load_dttm", "load_dttm_tz", "load_id", "op", "ts_ms",
         "source_ts_ms", "src_system_code", "extract_dttm", "src_chng_dttm", "row_hash"
@@ -220,16 +218,29 @@ public class FirebirdToIcebergJob {
                 System.out.println("    " + col.name + " : " + col.icebergType + " (JDBC type: " + col.jdbcType + ")");
             }
 
-            // 5c. Определяем ORDER BY (глобальный или первый столбец таблицы)
+            // 5c. Определяем ORDER BY: явный -> PK -> первый столбец
+            String detectedPk = detectPrimaryKeyColumn(fbUrl, fbUser, fbPass, tm.fbTable);
             String orderByColumn = (orderBy != null && !orderBy.isEmpty())
                     ? orderBy.toUpperCase()
-                    : columns.get(0).name.toUpperCase();
-            System.out.println("  Order by: " + orderByColumn);
+                    : (detectedPk != null ? detectedPk : columns.get(0).name.toUpperCase());
+            ColumnInfo orderByInfo = findColumnInfo(columns, orderByColumn);
+            if (orderByInfo == null) {
+                System.err.println("WARNING: ORDER BY column '" + orderByColumn + "' not found in metadata. Falling back to first column.");
+                orderByInfo = columns.get(0);
+                orderByColumn = orderByInfo.name.toUpperCase();
+            }
+            System.out.println("  Order by: " + orderByColumn + (detectedPk != null ? " (PK auto-detected)" : ""));
 
-            // 5d. Полный путь к таблице Iceberg
+            // 5d. Фиксируем watermark до старта загрузки для консистентного среза
+            Object watermarkValue = readWatermarkValue(fbUrl, fbUser, fbPass, tm.fbTable, orderByColumn);
+            String firebirdWatermarkCondition = buildFirebirdWatermarkCondition(orderByColumn, orderByInfo.jdbcType, watermarkValue);
+            String icebergWatermarkCondition = buildIcebergWatermarkCondition(orderByInfo.name, orderByInfo.jdbcType, watermarkValue);
+            System.out.println("  Watermark: " + (watermarkValue != null ? watermarkValue : "<NULL/EMPTY>"));
+
+            // 5e. Полный путь к таблице Iceberg
             String fullIcebergPath = "iceberg." + icebergDb + ".`" + tm.icebergTable + "`";
 
-            // 5e. Создаём/пересоздаём Iceberg таблицу
+            // 5f. Создаём/пересоздаём Iceberg таблицу
             if ("replace".equalsIgnoreCase(mode)) {
                 tableEnv.executeSql("DROP TABLE IF EXISTS " + fullIcebergPath);
             }
@@ -237,13 +248,15 @@ public class FirebirdToIcebergJob {
             System.out.println("  Creating Iceberg table: " + createSql);
             tableEnv.executeSql(createSql);
 
-            // 5f. Создаём Source DataStream с уникальным uid для checkpoint state
+            // 5g. Создаём Source DataStream с уникальным uid для checkpoint state
             RowTypeInfo rowTypeInfo = buildRowTypeInfo(columns);
             String safeTableName = tm.fbTable.toLowerCase().replace("$", "_");
             String sourceUid = "source-" + safeTableName;
             DataStream<Row> data = env
                 .addSource(
-                    new FirebirdDynamicSource(fbUrl, fbUser, fbPass, tm.fbTable, columns, orderByColumn, fetchSize),
+                    new FirebirdDynamicSource(
+                        fbUrl, fbUser, fbPass, tm.fbTable, columns, orderByColumn, fetchSize, firebirdWatermarkCondition
+                    ),
                     "firebird-" + safeTableName,
                     rowTypeInfo
                 )
@@ -251,18 +264,20 @@ public class FirebirdToIcebergJob {
 
             System.out.println("  Source operator uid: " + sourceUid);
 
-            // 5g. Регистрируем как временное представление
+            // 5h. Регистрируем как временное представление
             String viewName = "source_" + safeTableName;
             Schema schema = buildSchema(columns);
             tableEnv.createTemporaryView(viewName, data, schema);
 
-            // 5h. Добавляем INSERT в StatementSet
+            // 5i. Добавляем INSERT в StatementSet
             String insertSql = "INSERT INTO " + fullIcebergPath
                               + " SELECT * FROM " + viewName;
             System.out.println("  Insert SQL: " + insertSql);
                 stmtSet.addInsertSql(insertSql);
                 tablesAdded++;
-                loadedTables.add(new TableLoadContext(tm, columns, orderByColumn));
+                loadedTables.add(new TableLoadContext(
+                    tm, columns, orderByColumn, firebirdWatermarkCondition, icebergWatermarkCondition
+                ));
             }
 
             // 6. Выполняем текущий батч как отдельный Flink job
@@ -561,6 +576,109 @@ public class FirebirdToIcebergJob {
         return columns;
     }
 
+    static ColumnInfo findColumnInfo(List<ColumnInfo> columns, String columnName) {
+        if (columnName == null) return null;
+        for (ColumnInfo col : columns) {
+            if (col.name.equalsIgnoreCase(columnName)) {
+                return col;
+            }
+        }
+        return null;
+    }
+
+    static String detectPrimaryKeyColumn(String url, String user, String pass, String tableName) {
+        Properties props = new Properties();
+        props.setProperty("user", user);
+        props.setProperty("password", pass);
+        props.setProperty("encoding", "UTF8");
+        props.setProperty("authPlugins", "Srp256,Srp,Legacy_Auth");
+
+        try {
+            Class.forName("org.firebirdsql.jdbc.FBDriver");
+            try (Connection conn = DriverManager.getConnection(url, props)) {
+                DatabaseMetaData meta = conn.getMetaData();
+                String bestColumn = null;
+                int bestSeq = Integer.MAX_VALUE;
+                try (ResultSet rs = meta.getPrimaryKeys(null, null, tableName)) {
+                    while (rs.next()) {
+                        int keySeq = rs.getInt("KEY_SEQ");
+                        String col = rs.getString("COLUMN_NAME");
+                        if (col != null && keySeq < bestSeq) {
+                            bestSeq = keySeq;
+                            bestColumn = col.trim().toUpperCase();
+                        }
+                    }
+                }
+                return bestColumn;
+            }
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    static Object readWatermarkValue(String url, String user, String pass, String tableName, String orderByColumn) throws Exception {
+        Properties props = new Properties();
+        props.setProperty("user", user);
+        props.setProperty("password", pass);
+        props.setProperty("encoding", "UTF8");
+        props.setProperty("authPlugins", "Srp256,Srp,Legacy_Auth");
+
+        Class.forName("org.firebirdsql.jdbc.FBDriver");
+        String sql = "SELECT MAX(" + orderByColumn + ") FROM " + tableName;
+        try (Connection conn = DriverManager.getConnection(url, props);
+             Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery(sql)) {
+            if (!rs.next()) return null;
+            return rs.getObject(1);
+        }
+    }
+
+    static String buildFirebirdWatermarkCondition(String columnName, int jdbcType, Object watermarkValue) {
+        if (watermarkValue == null) {
+            return "1 = 0";
+        }
+        return columnName.toUpperCase() + " <= " + toSqlLiteral(watermarkValue, jdbcType, true);
+    }
+
+    static String buildIcebergWatermarkCondition(String columnName, int jdbcType, Object watermarkValue) {
+        if (watermarkValue == null) {
+            return "1 = 0";
+        }
+        return escapeColumnName(columnName) + " <= " + toSqlLiteral(watermarkValue, jdbcType, false);
+    }
+
+    static String toSqlLiteral(Object value, int jdbcType, boolean firebirdDialect) {
+        if (value == null) return "NULL";
+        switch (jdbcType) {
+            case java.sql.Types.TINYINT:
+            case java.sql.Types.SMALLINT:
+            case java.sql.Types.INTEGER:
+            case java.sql.Types.BIGINT:
+            case java.sql.Types.FLOAT:
+            case java.sql.Types.REAL:
+            case java.sql.Types.DOUBLE:
+            case java.sql.Types.NUMERIC:
+            case java.sql.Types.DECIMAL:
+                return value.toString();
+            case java.sql.Types.DATE:
+                return (firebirdDialect ? "DATE '" : "DATE '") + value.toString() + "'";
+            case java.sql.Types.TIME:
+            case java.sql.Types.TIME_WITH_TIMEZONE:
+                return (firebirdDialect ? "TIME '" : "TIME '") + value.toString() + "'";
+            case java.sql.Types.TIMESTAMP:
+            case java.sql.Types.TIMESTAMP_WITH_TIMEZONE:
+                String ts;
+                if (value instanceof Timestamp) {
+                    ts = ((Timestamp) value).toLocalDateTime().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS"));
+                } else {
+                    ts = value.toString().replace('T', ' ');
+                }
+                return (firebirdDialect ? "TIMESTAMP '" : "TIMESTAMP '") + ts + "'";
+            default:
+                return "'" + value.toString().replace("'", "''") + "'";
+        }
+    }
+
     // ======================================================================
     // Маппинг типов
     // ======================================================================
@@ -764,13 +882,19 @@ public class FirebirdToIcebergJob {
             sb.append(escapeColumnName(columns.get(i).name)).append(" ").append(columns.get(i).icebergType);
         }
         // Технические поля (имена зависят от наличия конфликтов)
-        String[] techTypes = {"TIMESTAMP NOT NULL", "TIMESTAMP", "BIGINT", "STRING", "BIGINT", "BIGINT", "STRING", "TIMESTAMP", "TIMESTAMP", "BIGINT"};
+        String[] techTypes = {"TIMESTAMP NOT NULL", "TIMESTAMP", "BIGINT", "STRING", "BIGINT", "BIGINT", "STRING", "TIMESTAMP", "TIMESTAMP", "STRING"};
         for (int i = 0; i < techNames.length; i++) {
             sb.append(", ").append(escapeColumnName(techNames[i])).append(" ").append(techTypes[i]);
         }
         sb.append(") WITH (");
         sb.append("  'format-version' = '2',");
-        sb.append("  'partitioning' = 'days(").append(techNames[0]).append(")'");
+        // Для аналитического чтения в StarRocks обычно эффективнее месячные партиции + крупные parquet-файлы.
+        sb.append("  'partitioning' = 'month(").append(techNames[0]).append(")',");
+        sb.append("  'write.format.default' = 'parquet',");
+        sb.append("  'write.parquet.compression-codec' = 'zstd',");
+        sb.append("  'write.target-file-size-bytes' = '").append(ICEBERG_TARGET_FILE_SIZE_BYTES).append("',");
+        sb.append("  'write.metadata.delete-after-commit.enabled' = 'true',");
+        sb.append("  'write.metadata.previous-versions-max' = '20'");
         sb.append(")");
         return sb.toString();
     }
@@ -792,7 +916,7 @@ public class FirebirdToIcebergJob {
         TypeInformation<?>[] techTypes = {
             Types.LOCAL_DATE_TIME, Types.LOCAL_DATE_TIME, Types.LONG,
             Types.STRING, Types.LONG, Types.LONG,
-            Types.STRING, Types.LOCAL_DATE_TIME, Types.LOCAL_DATE_TIME, Types.LONG
+            Types.STRING, Types.LOCAL_DATE_TIME, Types.LOCAL_DATE_TIME, Types.STRING
         };
         int o = columns.size();
         for (int i = 0; i < techNames.length; i++) {
@@ -818,7 +942,7 @@ public class FirebirdToIcebergJob {
             DataTypes.BIGINT().nullable(), DataTypes.STRING().nullable(),
             DataTypes.BIGINT().nullable(), DataTypes.BIGINT().nullable(),
             DataTypes.STRING().nullable(), DataTypes.TIMESTAMP(6).nullable(),
-            DataTypes.TIMESTAMP(6).nullable(), DataTypes.BIGINT().nullable()
+            DataTypes.TIMESTAMP(6).nullable(), DataTypes.STRING().nullable()
         };
         for (int i = 0; i < techNames.length; i++) {
             builder.column(techNames[i], techDataTypes[i]);
@@ -849,6 +973,7 @@ public class FirebirdToIcebergJob {
         private final List<ColumnInfo> columns;
         private final String orderByColumn;
         private final int fetchSize;
+        private final String watermarkCondition;
         private volatile boolean running = true;
 
         // === Checkpoint state ===
@@ -857,7 +982,7 @@ public class FirebirdToIcebergJob {
 
         public FirebirdDynamicSource(String url, String user, String password,
                                      String tableName, List<ColumnInfo> columns,
-                                     String orderByColumn, int fetchSize) {
+                                     String orderByColumn, int fetchSize, String watermarkCondition) {
             this.url = url;
             this.user = user;
             this.password = password;
@@ -865,6 +990,7 @@ public class FirebirdToIcebergJob {
             this.columns = columns;
             this.orderByColumn = orderByColumn;
             this.fetchSize = fetchSize;
+            this.watermarkCondition = watermarkCondition;
         }
 
         // ---------- CheckpointedFunction ----------
@@ -919,6 +1045,7 @@ public class FirebirdToIcebergJob {
             }
             query.append(", ").append(buildFirebirdRowHashExpression(columns)).append(" AS ROW_HASH");
             query.append(" FROM ").append(tableName);
+            query.append(" WHERE ").append(watermarkCondition);
             query.append(" ORDER BY ").append(orderByColumn);
 
             System.out.println("Executing query (offset=" + skipRows + "): " + query);
@@ -950,7 +1077,7 @@ public class FirebirdToIcebergJob {
                         row.setField(o + 6, "mis");                // src_system_code
                         row.setField(o + 7, null);                 // extract_dttm
                         row.setField(o + 8, null);                 // src_chng_dttm
-                        row.setField(o + 9, rs.getLong(srcCols + 1)); // row_hash (рассчитан в Firebird)
+                        row.setField(o + 9, rs.getString(srcCols + 1)); // row_hash (MD5, рассчитан в Firebird)
 
                         // Атомарно: emit + increment offset (под checkpoint lock)
                         synchronized (lock) {
@@ -1060,21 +1187,29 @@ public class FirebirdToIcebergJob {
         final TableMapping mapping;
         final List<ColumnInfo> columns;
         final String orderByColumn;
+        final String firebirdWatermarkCondition;
+        final String icebergWatermarkCondition;
 
-        TableLoadContext(TableMapping mapping, List<ColumnInfo> columns, String orderByColumn) {
+        TableLoadContext(TableMapping mapping,
+                         List<ColumnInfo> columns,
+                         String orderByColumn,
+                         String firebirdWatermarkCondition,
+                         String icebergWatermarkCondition) {
             this.mapping = mapping;
             this.columns = columns;
             this.orderByColumn = orderByColumn;
+            this.firebirdWatermarkCondition = firebirdWatermarkCondition;
+            this.icebergWatermarkCondition = icebergWatermarkCondition;
         }
     }
 
     static class TableHashResult {
         final long rowCount;
-        final BigInteger hashSum;
+        final long hashMismatchCount;
 
-        TableHashResult(long rowCount, BigInteger hashSum) {
+        TableHashResult(long rowCount, long hashMismatchCount) {
             this.rowCount = rowCount;
-            this.hashSum = hashSum;
+            this.hashMismatchCount = hashMismatchCount;
         }
     }
 
@@ -1100,21 +1235,23 @@ public class FirebirdToIcebergJob {
         System.out.println();
         System.out.println("=== Consistency check (Firebird vs Iceberg) ===");
         for (TableLoadContext ctx : loadedTables) {
-            TableHashResult fb = computeFirebirdTableHash(
-                fbUrl, fbUser, fbPass, ctx.mapping.fbTable, ctx.columns, ctx.orderByColumn
+            long firebirdCount = computeFirebirdTableCount(
+                fbUrl, fbUser, fbPass, ctx.mapping.fbTable, ctx.firebirdWatermarkCondition
             );
-            TableHashResult ib = computeIcebergTableHash(batchTableEnv, icebergDb, ctx.mapping.icebergTable, ctx.columns);
+            TableHashResult ib = computeIcebergTableHash(
+                batchTableEnv, icebergDb, ctx.mapping.icebergTable, ctx.columns, ctx.icebergWatermarkCondition
+            );
 
-            boolean countMatch = fb.rowCount == ib.rowCount;
-            boolean hashMatch = fb.hashSum.equals(ib.hashSum);
+            boolean countMatch = firebirdCount == ib.rowCount;
+            boolean hashMatch = ib.hashMismatchCount == 0;
             if (countMatch && hashMatch) {
                 System.out.println("  OK: " + ctx.mapping.fbTable + " -> " + ctx.mapping.icebergTable
-                    + " (rows=" + fb.rowCount + ", hash_sum=" + fb.hashSum + ")");
+                    + " (rows=" + ib.rowCount + ", hash_mismatch_count=0)");
             } else {
                 String error = "CONSISTENCY CHECK FAILED for table " + ctx.mapping.fbTable
                     + " -> " + ctx.mapping.icebergTable
-                    + " | Firebird(rows=" + fb.rowCount + ", hash_sum=" + fb.hashSum + ")"
-                    + " vs Iceberg(rows=" + ib.rowCount + ", hash_sum=" + ib.hashSum + ")";
+                    + " | Firebird(rows=" + firebirdCount + ")"
+                    + " vs Iceberg(rows=" + ib.rowCount + ", hash_mismatch_count=" + ib.hashMismatchCount + ")";
                 System.err.println("  ERROR: " + error);
                 throw new ConsistencyCheckException(error);
             }
@@ -1142,10 +1279,9 @@ public class FirebirdToIcebergJob {
         return tEnv;
     }
 
-    static TableHashResult computeFirebirdTableHash(String url, String user, String pass,
-                                                    String tableName,
-                                                    List<ColumnInfo> columns,
-                                                    String orderByColumn) throws Exception {
+    static long computeFirebirdTableCount(String url, String user, String pass,
+                                          String tableName,
+                                          String watermarkCondition) throws Exception {
         Properties props = new Properties();
         props.setProperty("user", user);
         props.setProperty("password", pass);
@@ -1154,47 +1290,43 @@ public class FirebirdToIcebergJob {
 
         Class.forName("org.firebirdsql.jdbc.FBDriver");
 
-        String rowHashExpr = buildFirebirdRowHashExpression(columns);
-        String modDec = "CAST(" + HASH_SUM_MODULUS + " AS DECIMAL(38, 0))";
-        String rowHashNormExpr = "CAST(MOD(MOD(CAST(ROW_HASH AS DECIMAL(38, 0)), " + modDec + ") + " + modDec + ", " + modDec + ") AS DECIMAL(38, 0))";
-        String query = "SELECT COUNT(*), COALESCE(SUM(ROW_HASH_DEC), CAST(0 AS DECIMAL(38, 0))) "
-            + "FROM (SELECT " + rowHashNormExpr + " AS ROW_HASH_DEC "
-            + "FROM (SELECT " + rowHashExpr + " AS ROW_HASH FROM " + tableName + " ORDER BY " + orderByColumn + ") src_hash"
-            + ") agg_hash";
+        String query = "SELECT COUNT(*) FROM " + tableName + " WHERE " + watermarkCondition;
 
         try (Connection conn = DriverManager.getConnection(url, props);
              Statement stmt = conn.createStatement();
              ResultSet rs = stmt.executeQuery(query)) {
             if (!rs.next()) {
-                return new TableHashResult(0L, BigInteger.ZERO);
+                return 0L;
             }
-            long count = rs.getLong(1);
-            BigDecimal sum = rs.getBigDecimal(2);
-            return new TableHashResult(count, sum != null ? sum.toBigInteger() : BigInteger.ZERO);
+            return rs.getLong(1);
         }
     }
 
     static TableHashResult computeIcebergTableHash(TableEnvironment tableEnv,
                                                    String icebergDb,
                                                    String icebergTable,
-                                                   List<ColumnInfo> columns) throws Exception {
+                                                   List<ColumnInfo> columns,
+                                                   String watermarkCondition) throws Exception {
         String[] techNames = resolveTechColumnNames(columns);
         String rowHashCol = techNames[techNames.length - 1];
+        String icebergHashExpr = buildIcebergRowHashExpression(columns);
 
-        String modDec = "CAST(" + HASH_SUM_MODULUS + " AS DECIMAL(38, 0))";
-        String rowHashNormExpr = "CAST(MOD(MOD(CAST(" + escapeColumnName(rowHashCol) + " AS DECIMAL(38, 0)), " + modDec + ") + " + modDec + ", " + modDec + ") AS DECIMAL(38, 0))";
-        String sql = "SELECT COUNT(*), COALESCE(SUM(" + rowHashNormExpr + "), CAST(0 AS DECIMAL(38, 0))) "
-            + "FROM iceberg." + icebergDb + ".`" + icebergTable + "`";
+        String sql = "SELECT COUNT(*), "
+            + "COALESCE(SUM(CASE WHEN " + escapeColumnName(rowHashCol) + " IS NOT NULL "
+            + "AND CAST(" + escapeColumnName(rowHashCol) + " AS STRING) = " + icebergHashExpr
+            + " THEN 0 ELSE 1 END), 0) "
+            + "FROM iceberg." + icebergDb + ".`" + icebergTable + "` "
+            + "WHERE " + watermarkCondition;
 
         TableResult result = tableEnv.executeSql(sql);
         try (CloseableIterator<Row> it = result.collect()) {
             if (!it.hasNext()) {
-                return new TableHashResult(0L, BigInteger.ZERO);
+                return new TableHashResult(0L, 0L);
             }
             Row row = it.next();
             long count = ((Number) row.getField(0)).longValue();
-            BigDecimal sum = (BigDecimal) row.getField(1);
-            return new TableHashResult(count, sum != null ? sum.toBigInteger() : BigInteger.ZERO);
+            long mismatchCount = ((Number) row.getField(1)).longValue();
+            return new TableHashResult(count, mismatchCount);
         }
     }
 
@@ -1212,7 +1344,24 @@ public class FirebirdToIcebergJob {
             String col = columns.get(i).name.toUpperCase();
             concat.append("COALESCE(CAST(").append(col).append(" AS VARCHAR(1000)), '<NULL>')");
         }
-        return "HASH(" + concat + ")";
+        return "CRYPT_HASH(" + concat + " USING MD5)";
+    }
+
+    /**
+     * Flink SQL-выражение md5 от конкатенации исходных колонок в Iceberg.
+     * Должно соответствовать логике buildFirebirdRowHashExpression.
+     */
+    static String buildIcebergRowHashExpression(List<ColumnInfo> columns) {
+        StringBuilder concat = new StringBuilder();
+        for (int i = 0; i < columns.size(); i++) {
+            if (i > 0) {
+                concat.append(" || '|' || ");
+            }
+            concat.append("COALESCE(CAST(")
+                .append(escapeColumnName(columns.get(i).name))
+                .append(" AS STRING), '<NULL>')");
+        }
+        return "MD5(" + concat + ")";
     }
 
     // ======================================================================
