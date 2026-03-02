@@ -77,6 +77,7 @@ public class FirebirdToIcebergJob {
     private static final int DEFAULT_BATCH_SIZE = 50;
     private static final int TECH_COLS_COUNT = 10;
     private static final long ICEBERG_TARGET_FILE_SIZE_BYTES = 536870912L; // 512 MB
+    private static final int CONSISTENCY_CHECK_PARALLELISM = 1;
     private static final String[] TECH_COL_BASE_NAMES = {
         "load_dttm", "load_dttm_tz", "load_id", "op", "ts_ms",
         "source_ts_ms", "src_system_code", "extract_dttm", "src_chng_dttm", "row_hash"
@@ -1300,6 +1301,14 @@ public class FirebirdToIcebergJob {
     static TableEnvironment createBatchTableEnvironmentForConsistency(String icebergDb) {
         EnvironmentSettings settings = EnvironmentSettings.newInstance().inBatchMode().build();
         TableEnvironment tEnv = TableEnvironment.create(settings);
+        // Consistency check query can be memory-heavy on large Parquet row groups.
+        // Keep low parallelism for predictable memory footprint.
+        tEnv.getConfig().getConfiguration().setString(
+            "parallelism.default", String.valueOf(CONSISTENCY_CHECK_PARALLELISM)
+        );
+        tEnv.getConfig().getConfiguration().setString(
+            "table.exec.resource.default-parallelism", String.valueOf(CONSISTENCY_CHECK_PARALLELISM)
+        );
         tEnv.executeSql(
             "CREATE CATALOG iceberg WITH (" +
             "  'type' = 'iceberg'," +
@@ -1355,6 +1364,7 @@ public class FirebirdToIcebergJob {
             + "AND LOWER(CAST(" + escapeColumnName(rowHashCol) + " AS STRING)) = LOWER(" + icebergHashExpr + ")"
             + " THEN 0 ELSE 1 END), 0) "
             + "FROM iceberg." + icebergDb + ".`" + icebergTable + "` "
+            + "/*+ OPTIONS('read.parquet.vectorization.enabled'='false') */ "
             + "WHERE " + watermarkCondition;
 
         TableResult result = tableEnv.executeSql(sql);
