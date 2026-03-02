@@ -30,6 +30,7 @@ import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Properties;
 
 /**
@@ -1077,7 +1078,7 @@ public class FirebirdToIcebergJob {
                         row.setField(o + 6, "mis");                // src_system_code
                         row.setField(o + 7, null);                 // extract_dttm
                         row.setField(o + 8, null);                 // src_chng_dttm
-                        row.setField(o + 9, rs.getString(srcCols + 1)); // row_hash (MD5, рассчитан в Firebird)
+                        row.setField(o + 9, normalizeRowHash(rs.getObject(srcCols + 1))); // row_hash (MD5 hex, рассчитан в Firebird)
 
                         // Атомарно: emit + increment offset (под checkpoint lock)
                         synchronized (lock) {
@@ -1171,6 +1172,31 @@ public class FirebirdToIcebergJob {
                 value = null;
             }
             return value;
+        }
+
+        /**
+         * Приводит hash из Firebird к единому строковому hex-формату (lowercase).
+         * CRYPT_HASH(... USING MD5) может приходить как byte[] (VARBINARY/BLOB).
+         */
+        private String normalizeRowHash(Object rawHash) {
+            if (rawHash == null) {
+                return null;
+            }
+            if (rawHash instanceof byte[]) {
+                return bytesToHexLower((byte[]) rawHash);
+            }
+            return rawHash.toString().trim().toLowerCase(Locale.ROOT);
+        }
+
+        private String bytesToHexLower(byte[] bytes) {
+            char[] hexChars = new char[bytes.length * 2];
+            final char[] digits = "0123456789abcdef".toCharArray();
+            for (int i = 0; i < bytes.length; i++) {
+                int v = bytes[i] & 0xFF;
+                hexChars[i * 2] = digits[v >>> 4];
+                hexChars[i * 2 + 1] = digits[v & 0x0F];
+            }
+            return new String(hexChars);
         }
 
         @Override
@@ -1313,7 +1339,7 @@ public class FirebirdToIcebergJob {
 
         String sql = "SELECT COUNT(*), "
             + "COALESCE(SUM(CASE WHEN " + escapeColumnName(rowHashCol) + " IS NOT NULL "
-            + "AND CAST(" + escapeColumnName(rowHashCol) + " AS STRING) = " + icebergHashExpr
+            + "AND LOWER(CAST(" + escapeColumnName(rowHashCol) + " AS STRING)) = LOWER(" + icebergHashExpr + ")"
             + " THEN 0 ELSE 1 END), 0) "
             + "FROM iceberg." + icebergDb + ".`" + icebergTable + "` "
             + "WHERE " + watermarkCondition;
