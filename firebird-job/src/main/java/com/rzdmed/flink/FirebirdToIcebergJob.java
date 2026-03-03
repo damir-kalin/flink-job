@@ -31,6 +31,7 @@ import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.Objects;
 import java.util.Properties;
 
 /**
@@ -351,7 +352,7 @@ public class FirebirdToIcebergJob {
                 }
 
                 try {
-                    runConsistencyChecks(icebergDb, loadedTables);
+                    runConsistencyChecks(icebergDb, fbUrl, fbUser, fbPass, loadedTables);
                 } catch (ConsistencyCheckException e) {
                     System.err.println("ERROR: Consistency check failed for batch " + batchNumber + ": " + e.getMessage());
                     if (failOnConsistencyError) {
@@ -1258,6 +1259,9 @@ public class FirebirdToIcebergJob {
     }
 
     static void runConsistencyChecks(String icebergDb,
+                                     String firebirdUrl,
+                                     String firebirdUser,
+                                     String firebirdPass,
                                      List<TableLoadContext> loadedTables) throws Exception {
         if (loadedTables.isEmpty()) {
             return;
@@ -1298,6 +1302,23 @@ public class FirebirdToIcebergJob {
                     + " vs Iceberg(rows=" + actual.rowCount
                     + ", hash_mismatch_count=" + actual.hashMismatchCount + ")";
                 System.err.println("  ERROR: " + error);
+                printIcebergHashMismatchSamples(
+                    batchTableEnv,
+                    icebergDb,
+                    ctx.mapping.icebergTable,
+                    ctx.orderByColumn,
+                    ctx.columns,
+                    ctx.icebergWatermarkCondition,
+                    10
+                );
+                printFirstColumnTokenMismatch(
+                    batchTableEnv,
+                    icebergDb,
+                    firebirdUrl,
+                    firebirdUser,
+                    firebirdPass,
+                    ctx
+                );
                 throw new ConsistencyCheckException(error);
             }
         }
@@ -1386,6 +1407,163 @@ public class FirebirdToIcebergJob {
         return new SnapshotMetrics(rowCount, hashMismatchCount);
     }
 
+    static void printIcebergHashMismatchSamples(TableEnvironment tableEnv,
+                                                String icebergDb,
+                                                String icebergTable,
+                                                String orderByColumn,
+                                                List<ColumnInfo> columns,
+                                                String watermarkCondition,
+                                                int limit) {
+        try {
+            String[] techNames = resolveTechColumnNames(columns);
+            String rowHashCol = techNames[techNames.length - 2];
+            String rowHashIcebergCol = techNames[techNames.length - 1];
+            String orderByResolved = orderByColumn;
+            for (ColumnInfo c : columns) {
+                if (c.name != null && c.name.equalsIgnoreCase(orderByColumn)) {
+                    orderByResolved = c.name;
+                    break;
+                }
+            }
+            String orderCol = escapeColumnName(orderByResolved);
+            String sql = "SELECT CAST(" + orderCol + " AS STRING), "
+                + "CAST(" + escapeColumnName(rowHashCol) + " AS STRING), "
+                + "CAST(" + escapeColumnName(rowHashIcebergCol) + " AS STRING) "
+                + "FROM iceberg." + icebergDb + ".`" + icebergTable + "` "
+                + "WHERE " + watermarkCondition + " AND "
+                + "LOWER(CAST(" + escapeColumnName(rowHashCol) + " AS STRING)) <> "
+                + "LOWER(CAST(" + escapeColumnName(rowHashIcebergCol) + " AS STRING)) "
+                + "ORDER BY " + orderCol + " "
+                + "FETCH FIRST " + Math.max(1, limit) + " ROWS ONLY";
+
+            System.err.println("  MISMATCH SAMPLE SQL: " + sql);
+            TableResult result = tableEnv.executeSql(sql);
+            System.err.println("  First hash mismatches (order_by, row_hash, row_hash_iceberg):");
+            int i = 0;
+            try (CloseableIterator<Row> it = result.collect()) {
+                while (it.hasNext()) {
+                    Row row = it.next();
+                    i++;
+                    System.err.println("    [" + i + "] " + row.getField(0)
+                        + " | " + row.getField(1)
+                        + " | " + row.getField(2));
+                }
+            }
+            if (i == 0) {
+                System.err.println("    (no rows returned)");
+            }
+        } catch (Exception e) {
+            System.err.println("  WARN: unable to print mismatch samples: " + e.getMessage());
+        }
+    }
+
+    static void printFirstColumnTokenMismatch(TableEnvironment tableEnv,
+                                              String icebergDb,
+                                              String firebirdUrl,
+                                              String firebirdUser,
+                                              String firebirdPass,
+                                              TableLoadContext ctx) {
+        try {
+            String orderByResolved = ctx.orderByColumn;
+            for (ColumnInfo c : ctx.columns) {
+                if (c.name != null && c.name.equalsIgnoreCase(ctx.orderByColumn)) {
+                    orderByResolved = c.name;
+                    break;
+                }
+            }
+            String[] techNames = resolveTechColumnNames(ctx.columns);
+            String rowHashCol = techNames[techNames.length - 2];
+            String rowHashIcebergCol = techNames[techNames.length - 1];
+            String orderCol = escapeColumnName(orderByResolved);
+
+            String firstMismatchKeySql = "SELECT CAST(" + orderCol + " AS STRING) "
+                + "FROM iceberg." + icebergDb + ".`" + ctx.mapping.icebergTable + "` "
+                + "WHERE " + ctx.icebergWatermarkCondition + " AND "
+                + "LOWER(CAST(" + escapeColumnName(rowHashCol) + " AS STRING)) <> "
+                + "LOWER(CAST(" + escapeColumnName(rowHashIcebergCol) + " AS STRING)) "
+                + "ORDER BY " + orderCol + " FETCH FIRST 1 ROWS ONLY";
+
+            String mismatchKey = null;
+            TableResult keyResult = tableEnv.executeSql(firstMismatchKeySql);
+            try (CloseableIterator<Row> it = keyResult.collect()) {
+                if (it.hasNext()) {
+                    mismatchKey = String.valueOf(it.next().getField(0));
+                }
+            }
+            if (mismatchKey == null) {
+                System.err.println("  DEBUG: no mismatch key found for deep diagnostics.");
+                return;
+            }
+            System.err.println("  DEBUG: first mismatch key (" + orderByResolved + ") = " + mismatchKey);
+
+            StringBuilder icebergSelect = new StringBuilder();
+            StringBuilder firebirdSelect = new StringBuilder();
+            for (int i = 0; i < ctx.columns.size(); i++) {
+                if (i > 0) {
+                    icebergSelect.append(", ");
+                    firebirdSelect.append(", ");
+                }
+                icebergSelect.append(buildIcebergHashValueExpression(ctx.columns.get(i)))
+                    .append(" AS c").append(i);
+                firebirdSelect.append(buildFirebirdHashValueExpression(ctx.columns.get(i)))
+                    .append(" AS c").append(i);
+            }
+
+            String icebergSql = "SELECT " + icebergSelect
+                + " FROM iceberg." + icebergDb + ".`" + ctx.mapping.icebergTable + "` "
+                + "WHERE CAST(" + orderCol + " AS STRING) = '" + mismatchKey + "' "
+                + "FETCH FIRST 1 ROWS ONLY";
+
+            Row icebergRow = null;
+            TableResult icebergResult = tableEnv.executeSql(icebergSql);
+            try (CloseableIterator<Row> it = icebergResult.collect()) {
+                if (it.hasNext()) {
+                    icebergRow = it.next();
+                }
+            }
+            if (icebergRow == null) {
+                System.err.println("  DEBUG: mismatch row not found in Iceberg for key=" + mismatchKey);
+                return;
+            }
+
+            Properties props = new Properties();
+            props.setProperty("user", firebirdUser);
+            props.setProperty("password", firebirdPass);
+            props.setProperty("encoding", "UTF8");
+            props.setProperty("authPlugins", "Srp256,Srp,Legacy_Auth");
+            Class.forName("org.firebirdsql.jdbc.FBDriver");
+
+            String firebirdSql = "SELECT " + firebirdSelect
+                + " FROM " + ctx.mapping.fbTable
+                + " WHERE CAST(" + orderByResolved.toUpperCase() + " AS VARCHAR(100)) = '" + mismatchKey + "'";
+
+            try (Connection conn = DriverManager.getConnection(firebirdUrl, props);
+                 Statement stmt = conn.createStatement();
+                 ResultSet rs = stmt.executeQuery(firebirdSql)) {
+                if (!rs.next()) {
+                    System.err.println("  DEBUG: mismatch row not found in Firebird for key=" + mismatchKey);
+                    return;
+                }
+                for (int i = 0; i < ctx.columns.size(); i++) {
+                    String fbVal = rs.getString(i + 1);
+                    String ibVal = (String) icebergRow.getField(i);
+                    if (!Objects.equals(fbVal, ibVal)) {
+                        ColumnInfo col = ctx.columns.get(i);
+                        System.err.println("  DEBUG FIRST TOKEN MISMATCH: column=" + col.name
+                            + " (jdbcType=" + col.jdbcType + ", fbType=" + col.typeName + ")"
+                            + " | Firebird=" + fbVal
+                            + " | Iceberg=" + ibVal);
+                        return;
+                    }
+                }
+                System.err.println("  DEBUG: no token-level mismatch found for key=" + mismatchKey
+                    + ", but row hash differs.");
+            }
+        } catch (Exception e) {
+            System.err.println("  WARN: unable to print deep token mismatch diagnostics: " + e.getMessage());
+        }
+    }
+
     /**
      * Приводит hash к единому строковому hex-формату (lowercase).
      */
@@ -1436,15 +1614,18 @@ public class FirebirdToIcebergJob {
         switch (column.jdbcType) {
             case java.sql.Types.REAL:
             case java.sql.Types.FLOAT:
-                // Нормализуем Firebird FLOAT так же, как в Flink-выражении hash.
-                return "COALESCE(CAST(CAST(" + col + " AS DECIMAL(38, 7)) AS VARCHAR(1000)), '<NULL>')";
+                // Для FLOAT устраняем шум двоичной арифметики: округляем до 6 знаков.
+                return "COALESCE(CAST(CAST(ROUND(" + col + ", 6) AS DECIMAL(38, 6)) AS VARCHAR(1000)), '<NULL>')";
             case java.sql.Types.DOUBLE:
-                // Нормализуем Firebird DOUBLE так же, как в Flink-выражении hash.
-                return "COALESCE(CAST(CAST(" + col + " AS DECIMAL(38, 15)) AS VARCHAR(1000)), '<NULL>')";
+                // Для DOUBLE устраняем шум хвостов (например ...000001 vs ...000000).
+                return "COALESCE(CAST(CAST(ROUND(" + col + ", 6) AS DECIMAL(38, 6)) AS VARCHAR(1000)), '<NULL>')";
             case java.sql.Types.TIME_WITH_TIMEZONE:
                 // В текущем JDBC-потоке TIME WITH TIME ZONE фактически теряется до секунд.
                 // Приводим Firebird-сторону к HH:mm:ss.0000, чтобы синхронизировать hash.
                 return "COALESCE(SUBSTRING(CAST(CAST(" + col + " AS TIME) AS VARCHAR(1000)) FROM 1 FOR 8) || '.0000', '<NULL>')";
+            case java.sql.Types.TIME:
+                // Для обычного TIME также фиксируем формат до 4 знаков долей секунды.
+                return "COALESCE(SUBSTRING(CAST(" + col + " AS VARCHAR(1000)) FROM 1 FOR 8) || '.0000', '<NULL>')";
             case java.sql.Types.TIMESTAMP_WITH_TIMEZONE:
                 return "COALESCE(CAST(CAST(" + col + " AS TIMESTAMP) AS VARCHAR(1000)), '<NULL>')";
             default:
@@ -1493,19 +1674,23 @@ public class FirebirdToIcebergJob {
                 break;
             case java.sql.Types.REAL:
             case java.sql.Types.FLOAT:
-                // В Firebird FLOAT обычно сериализуется с фиксированным scale (пример: 1.2500000).
-                valueExpr = "CAST(CAST(" + col + " AS DECIMAL(38, 7)) AS STRING)";
+                // Синхронизируем с Firebird: сглаживаем floating-шум и фиксируем scale.
+                valueExpr = "CAST(CAST(ROUND(CAST(" + col + " AS DOUBLE), 6) AS DECIMAL(38, 6)) AS STRING)";
                 break;
             case java.sql.Types.DOUBLE:
-                // В Firebird DOUBLE обычно сериализуется с фиксированным scale (пример: 2.500000000000000).
-                valueExpr = "CAST(CAST(" + col + " AS DECIMAL(38, 15)) AS STRING)";
+                // Синхронизируем с Firebird: сглаживаем хвосты и фиксируем scale.
+                valueExpr = "CAST(CAST(ROUND(CAST(" + col + " AS DOUBLE), 6) AS DECIMAL(38, 6)) AS STRING)";
                 break;
             case java.sql.Types.CHAR:
             case java.sql.Types.NCHAR:
                 // JDBC для CHAR часто возвращает обрезанное значение, а Firebird hash считает с паддингом до длины CHAR.
                 // Восстанавливаем семантику Firebird через RPAD до declared precision.
-                int charLen = column.precision > 0 ? column.precision : 1;
-                valueExpr = "RPAD(CAST(" + col + " AS STRING), " + charLen + ", ' ')";
+                if (column.precision > 0) {
+                    valueExpr = "RPAD(CAST(" + col + " AS STRING), " + column.precision + ", ' ')";
+                } else {
+                    // Если metadata не дала длину, нельзя делать fallback к 1 символу — это обрежет значение и сломает hash.
+                    valueExpr = "CAST(" + col + " AS STRING)";
+                }
                 break;
             default:
                 valueExpr = "CAST(" + col + " AS STRING)";
