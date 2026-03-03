@@ -1338,10 +1338,6 @@ public class FirebirdToIcebergJob {
         tEnv.getConfig().getConfiguration().setString(
             "table.exec.resource.default-parallelism", String.valueOf(CONSISTENCY_CHECK_PARALLELISM)
         );
-        // Extra safety: apply the same limits via SQL-level SET, so planner/runtime
-        // for this TableEnvironment does not pick higher defaults from session/cluster.
-        tEnv.executeSql("SET 'parallelism.default' = '" + CONSISTENCY_CHECK_PARALLELISM + "'");
-        tEnv.executeSql("SET 'table.exec.resource.default-parallelism' = '" + CONSISTENCY_CHECK_PARALLELISM + "'");
         tEnv.executeSql(
             "CREATE CATALOG iceberg WITH (" +
             "  'type' = 'iceberg'," +
