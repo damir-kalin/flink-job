@@ -67,9 +67,9 @@ import java.util.Properties;
 public class FirebirdToIcebergJob {
 
     // === Defaults ===
-    private static final String DEFAULT_FB_URL = "jdbc:firebirdsql://firebird:3050//firebird/data/testdb.fdb";
-    private static final String DEFAULT_FB_USER = "SYSDBA";
-    private static final String DEFAULT_FB_PASS = "Q1w2e3r+";
+    private static final String DEFAULT_FB_URL = "jdbc:firebirdsql://10.216.1.229:3050/esud_99099";
+    private static final String DEFAULT_FB_USER = "BI_USER";
+    private static final String DEFAULT_FB_PASS = "bi_user_pass";
     private static final String DEFAULT_ICEBERG_DB = "rzdm__mis";
     private static final String DEFAULT_MODE = "append";
     private static final int DEFAULT_PARALLELISM = 8;
@@ -85,12 +85,12 @@ public class FirebirdToIcebergJob {
 
     // === Iceberg catalog settings ===
     private static final String ICEBERG_CATALOG_URI = "http://iceberg-rest:8181";
-    private static final String ICEBERG_WAREHOUSE = "s3://iceberg/";
-    private static final String S3_ENDPOINT = "http://minio-svc:9000";
+    private static final String ICEBERG_WAREHOUSE = "s3://rzdm-test-data-lake/";
+    private static final String S3_ENDPOINT = "https://hb.ru-msk.vkcloud-storage.ru";
     private static final String S3_REGION = "ru-central1";
-    private static final String S3_ACCESS_KEY = "minioadmin";
-    private static final String S3_SECRET_KEY = "Q1w2e3r+";
-    private static final String FLINK_CHECKPOINTS_PATH = "s3://flink/checkpoints";
+    private static final String S3_ACCESS_KEY = "qBit7b7Aztj3gCnBkD2LFW";
+    private static final String S3_SECRET_KEY = "hSrwMWk9mmwue7UgrW6ptyoeYfXe7ugkUsabHTVSyyrJ";
+    private static final String FLINK_CHECKPOINTS_PATH = "s3://rzdm-test-technical-area/flink/checkpoints";
 
     // ======================================================================
 
@@ -827,7 +827,7 @@ public class FirebirdToIcebergJob {
                 base = DataTypes.DATE(); break;
             case java.sql.Types.TIME:
             case java.sql.Types.TIME_WITH_TIMEZONE:
-                base = DataTypes.TIME(); break;
+                base = DataTypes.TIME(4); break;
             case java.sql.Types.TIMESTAMP:
             case java.sql.Types.TIMESTAMP_WITH_TIMEZONE:
                 base = DataTypes.TIMESTAMP(6); break;
@@ -1421,10 +1421,28 @@ public class FirebirdToIcebergJob {
             if (i > 0) {
                 concat.append(" || '|' || ");
             }
-            String col = columns.get(i).name.toUpperCase();
-            concat.append("COALESCE(CAST(").append(col).append(" AS VARCHAR(1000)), '<NULL>')");
+            concat.append(buildFirebirdHashValueExpression(columns.get(i)));
         }
         return "CRYPT_HASH(" + concat + " USING MD5)";
+    }
+
+    /**
+     * Формирует строковое представление значения для hash в Firebird.
+     * Для timezone-типов явно нормализуем до локальных TIME/TIMESTAMP, так как в пайплайне
+     * JDBC (readColumn) они читаются как LocalTime/LocalDateTime без timezone.
+     */
+    static String buildFirebirdHashValueExpression(ColumnInfo column) {
+        String col = column.name.toUpperCase();
+        switch (column.jdbcType) {
+            case java.sql.Types.TIME_WITH_TIMEZONE:
+                // В текущем JDBC-потоке TIME WITH TIME ZONE фактически теряется до секунд.
+                // Приводим Firebird-сторону к HH:mm:ss.0000, чтобы синхронизировать hash.
+                return "COALESCE(SUBSTRING(CAST(CAST(" + col + " AS TIME) AS VARCHAR(1000)) FROM 1 FOR 8) || '.0000', '<NULL>')";
+            case java.sql.Types.TIMESTAMP_WITH_TIMEZONE:
+                return "COALESCE(CAST(CAST(" + col + " AS TIMESTAMP) AS VARCHAR(1000)), '<NULL>')";
+            default:
+                return "COALESCE(CAST(" + col + " AS VARCHAR(1000)), '<NULL>')";
+        }
     }
 
     /**
@@ -1446,7 +1464,8 @@ public class FirebirdToIcebergJob {
      * Формируем строковое представление значения для hash в стиле Firebird:
      * - null -> '<NULL>'
      * - ограничение длины до 1000 символов (аналог CAST(... AS VARCHAR(1000)))
-     * - для TIMESTAMP фиксируем формат до миллисекунд
+     * - для TIMESTAMP фиксируем формат до 4 знаков долей секунды
+     * - для REAL/FLOAT/DOUBLE фиксируем scale, чтобы совпадать с Firebird CAST(... AS VARCHAR)
      */
     static String buildIcebergHashValueExpression(ColumnInfo column) {
         String col = escapeColumnName(column.name);
@@ -1456,6 +1475,30 @@ public class FirebirdToIcebergJob {
             case java.sql.Types.TIMESTAMP_WITH_TIMEZONE:
                 // Firebird CAST(TIMESTAMP AS VARCHAR) использует 4 знака долей секунды.
                 valueExpr = "DATE_FORMAT(CAST(" + col + " AS TIMESTAMP(4)), 'yyyy-MM-dd HH:mm:ss.SSSS')";
+                break;
+            case java.sql.Types.TIME:
+            case java.sql.Types.TIME_WITH_TIMEZONE:
+                // Firebird ожидает HH:mm:ss.SSSS.
+                // Если дробная часть уже присутствует, не дописываем .0000 повторно.
+                valueExpr = "CASE WHEN POSITION('.' IN CAST(" + col + " AS STRING)) > 0 "
+                    + "THEN CAST(" + col + " AS STRING) "
+                    + "ELSE CONCAT(CAST(" + col + " AS STRING), '.0000') END";
+                break;
+            case java.sql.Types.REAL:
+            case java.sql.Types.FLOAT:
+                // В Firebird FLOAT обычно сериализуется с фиксированным scale (пример: 1.2500000).
+                valueExpr = "CAST(CAST(" + col + " AS DECIMAL(38, 7)) AS STRING)";
+                break;
+            case java.sql.Types.DOUBLE:
+                // В Firebird DOUBLE обычно сериализуется с фиксированным scale (пример: 2.500000000000000).
+                valueExpr = "CAST(CAST(" + col + " AS DECIMAL(38, 15)) AS STRING)";
+                break;
+            case java.sql.Types.CHAR:
+            case java.sql.Types.NCHAR:
+                // JDBC для CHAR часто возвращает обрезанное значение, а Firebird hash считает с паддингом до длины CHAR.
+                // Восстанавливаем семантику Firebird через RPAD до declared precision.
+                int charLen = column.precision > 0 ? column.precision : 1;
+                valueExpr = "RPAD(CAST(" + col + " AS STRING), " + charLen + ", ' ')";
                 break;
             default:
                 valueExpr = "CAST(" + col + " AS STRING)";
