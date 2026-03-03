@@ -1345,7 +1345,7 @@ public class FirebirdToIcebergJob {
         props.setProperty("authPlugins", "Srp256,Srp,Legacy_Auth");
 
         Class.forName("org.firebirdsql.jdbc.FBDriver");
-        String query = "SELECT COUNT(*) FROM " + tableName + " WHERE " + watermarkCondition;
+        String query = "SELECT COUNT(1) FROM " + tableName + " WHERE " + watermarkCondition;
         long rowCount = 0L;
         try (Connection conn = DriverManager.getConnection(url, props);
              Statement stmt = conn.createStatement()) {
@@ -1434,6 +1434,13 @@ public class FirebirdToIcebergJob {
     static String buildFirebirdHashValueExpression(ColumnInfo column) {
         String col = column.name.toUpperCase();
         switch (column.jdbcType) {
+            case java.sql.Types.REAL:
+            case java.sql.Types.FLOAT:
+                // Нормализуем Firebird FLOAT так же, как в Flink-выражении hash.
+                return "COALESCE(CAST(CAST(" + col + " AS DECIMAL(38, 7)) AS VARCHAR(1000)), '<NULL>')";
+            case java.sql.Types.DOUBLE:
+                // Нормализуем Firebird DOUBLE так же, как в Flink-выражении hash.
+                return "COALESCE(CAST(CAST(" + col + " AS DECIMAL(38, 15)) AS VARCHAR(1000)), '<NULL>')";
             case java.sql.Types.TIME_WITH_TIMEZONE:
                 // В текущем JDBC-потоке TIME WITH TIME ZONE фактически теряется до секунд.
                 // Приводим Firebird-сторону к HH:mm:ss.0000, чтобы синхронизировать hash.
