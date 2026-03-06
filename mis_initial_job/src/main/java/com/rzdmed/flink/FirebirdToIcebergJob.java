@@ -92,6 +92,7 @@ public class FirebirdToIcebergJob {
     private static final String S3_ACCESS_KEY = "qBit7b7Aztj3gCnBkD2LFW";
     private static final String S3_SECRET_KEY = "hSrwMWk9mmwue7UgrW6ptyoeYfXe7ugkUsabHTVSyyrJ";
     private static final String FLINK_CHECKPOINTS_PATH = "s3://rzdm-test-technical-area/flink/checkpoints";
+    
 
     // ======================================================================
 
