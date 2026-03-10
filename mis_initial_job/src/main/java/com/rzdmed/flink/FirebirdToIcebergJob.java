@@ -1385,11 +1385,11 @@ public class FirebirdToIcebergJob {
         String[] techNames = resolveTechColumnNames(columns);
         String rowHashCol = techNames[techNames.length - 2];
         String rowHashIcebergCol = techNames[techNames.length - 1];
-        String compareSql = "SELECT COUNT(*), "
+        String compareSql = "SELECT COUNT(1), "
             + "COALESCE(SUM(CASE WHEN LOWER(CAST(" + escapeColumnName(rowHashCol) + " AS STRING)) = "
             + "LOWER(CAST(" + escapeColumnName(rowHashIcebergCol) + " AS STRING)) THEN 0 ELSE 1 END), 0) "
             + "FROM iceberg." + icebergDb + "." + escapeColumnName(icebergTable) + " "
-            + "/*+ OPTIONS('read.parquet.vectorization.enabled'='false') */ "
+            // + "/*+ OPTIONS('read.parquet.vectorization.enabled'='false') */ "
             + "WHERE " + watermarkCondition;
 
         long rowCount = 0L;
