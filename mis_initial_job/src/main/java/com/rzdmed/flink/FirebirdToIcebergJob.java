@@ -1613,10 +1613,15 @@ public class FirebirdToIcebergJob {
             case java.sql.Types.REAL:
             case java.sql.Types.FLOAT:
                 // Для FLOAT устраняем шум двоичной арифметики: округляем до 6 знаков.
-                return "COALESCE(CAST(CAST(ROUND(" + col + ", 6) AS DECIMAL(38, 6)) AS VARCHAR(1000)), '<NULL>')";
+                return "COALESCE(REPLACE(CAST(CAST(ROUND(" + col + ", 6) AS DECIMAL(38, 6)) AS VARCHAR(1000)), ',', '.'), '<NULL>')";
             case java.sql.Types.DOUBLE:
                 // Для DOUBLE устраняем шум хвостов (например ...000001 vs ...000000).
-                return "COALESCE(CAST(CAST(ROUND(" + col + ", 6) AS DECIMAL(38, 6)) AS VARCHAR(1000)), '<NULL>')";
+                return "COALESCE(REPLACE(CAST(CAST(ROUND(" + col + ", 6) AS DECIMAL(38, 6)) AS VARCHAR(1000)), ',', '.'), '<NULL>')";
+            case java.sql.Types.NUMERIC:
+            case java.sql.Types.DECIMAL:
+                // В некоторых БД Firebird CAST(... AS VARCHAR) для decimal использует запятую.
+                // Нормализуем десятичный разделитель к точке, как в Flink/Iceberg.
+                return "COALESCE(REPLACE(CAST(" + col + " AS VARCHAR(1000)), ',', '.'), '<NULL>')";
             case java.sql.Types.TIME_WITH_TIMEZONE:
                 // В текущем JDBC-потоке TIME WITH TIME ZONE фактически теряется до секунд.
                 // Приводим Firebird-сторону к HH:mm:ss.0000, чтобы синхронизировать hash.
