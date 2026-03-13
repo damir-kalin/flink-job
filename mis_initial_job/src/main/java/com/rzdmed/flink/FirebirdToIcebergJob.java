@@ -1508,8 +1508,7 @@ public class FirebirdToIcebergJob {
                 }
                 icebergSelect.append(buildIcebergHashValueExpression(ctx.columns.get(i)))
                     .append(" AS c").append(i);
-                firebirdSelect.append(buildFirebirdHashValueExpression(ctx.columns.get(i)))
-                    .append(" AS c").append(i);
+                firebirdSelect.append(escapeFirebirdIdentifier(ctx.columns.get(i).name));
             }
 
             String icebergSql = "SELECT " + icebergSelect
@@ -1548,7 +1547,8 @@ public class FirebirdToIcebergJob {
                     return;
                 }
                 for (int i = 0; i < ctx.columns.size(); i++) {
-                    String fbVal = rs.getString(i + 1);
+                    Object rawFbVal = readColumnByType(rs, i + 1, ctx.columns.get(i).jdbcType);
+                    String fbVal = toHashTokenJava(ctx.columns.get(i), rawFbVal);
                     String ibVal = (String) icebergRow.getField(i);
                     if (!Objects.equals(fbVal, ibVal)) {
                         ColumnInfo col = ctx.columns.get(i);
@@ -1641,12 +1641,13 @@ public class FirebirdToIcebergJob {
                 break;
             case java.sql.Types.TIME:
             case java.sql.Types.TIME_WITH_TIMEZONE:
+                // Firebird hash использует HH:mm:ss.0000 (см. buildFirebirdHashValueExpression).
                 if (value instanceof LocalTime) {
-                    String timeBase = value.toString();
-                    s = timeBase.contains(".") ? timeBase : (timeBase + ".0000");
+                    s = ((LocalTime) value).format(DateTimeFormatter.ofPattern("HH:mm:ss")) + ".0000";
                 } else {
                     String timeBase = value.toString();
-                    s = timeBase.contains(".") ? timeBase : (timeBase + ".0000");
+                    String hhmmss = timeBase.length() >= 8 ? timeBase.substring(0, 8) : timeBase;
+                    s = hhmmss + ".0000";
                 }
                 break;
             case java.sql.Types.TIMESTAMP:
@@ -1690,6 +1691,53 @@ public class FirebirdToIcebergJob {
             s = s.substring(0, 1000);
         }
         return s;
+    }
+
+    static Object readColumnByType(ResultSet rs, int colIndex, int jdbcType) throws SQLException {
+        switch (jdbcType) {
+            case java.sql.Types.BIT:
+            case java.sql.Types.BOOLEAN:
+                boolean b = rs.getBoolean(colIndex);
+                return rs.wasNull() ? null : b;
+            case java.sql.Types.TINYINT:
+            case java.sql.Types.SMALLINT:
+                short s = rs.getShort(colIndex);
+                return rs.wasNull() ? null : s;
+            case java.sql.Types.INTEGER:
+                int i = rs.getInt(colIndex);
+                return rs.wasNull() ? null : i;
+            case java.sql.Types.BIGINT:
+                long l = rs.getLong(colIndex);
+                return rs.wasNull() ? null : l;
+            case java.sql.Types.FLOAT:
+            case java.sql.Types.REAL:
+                float f = rs.getFloat(colIndex);
+                return rs.wasNull() ? null : f;
+            case java.sql.Types.DOUBLE:
+                double d = rs.getDouble(colIndex);
+                return rs.wasNull() ? null : d;
+            case java.sql.Types.NUMERIC:
+            case java.sql.Types.DECIMAL:
+                return rs.getBigDecimal(colIndex);
+            case java.sql.Types.DATE:
+                Date dt = rs.getDate(colIndex);
+                return dt != null ? dt.toLocalDate() : null;
+            case java.sql.Types.TIME:
+            case java.sql.Types.TIME_WITH_TIMEZONE:
+                Time tm = rs.getTime(colIndex);
+                return tm != null ? tm.toLocalTime() : null;
+            case java.sql.Types.TIMESTAMP:
+            case java.sql.Types.TIMESTAMP_WITH_TIMEZONE:
+                Timestamp ts = rs.getTimestamp(colIndex);
+                return ts != null ? ts.toLocalDateTime() : null;
+            case java.sql.Types.BINARY:
+            case java.sql.Types.VARBINARY:
+            case java.sql.Types.LONGVARBINARY:
+            case java.sql.Types.BLOB:
+                return rs.getBytes(colIndex);
+            default:
+                return rs.getString(colIndex);
+        }
     }
 
     /**
