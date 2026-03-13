@@ -1609,30 +1609,34 @@ public class FirebirdToIcebergJob {
      */
     static String buildFirebirdHashValueExpression(ColumnInfo column) {
         String col = escapeFirebirdIdentifier(column.name);
+        // Для длинных строк не кастуем сразу к VARCHAR(1000), т.к. это даёт
+        // string right truncation (22001) уже на этапе CAST. Сначала берём
+        // широкий VARCHAR, затем обрезаем до 1000 символов через SUBSTRING.
+        String safeString1000 = "SUBSTRING(CAST(" + col + " AS VARCHAR(32765)) FROM 1 FOR 1000)";
         switch (column.jdbcType) {
             case java.sql.Types.REAL:
             case java.sql.Types.FLOAT:
                 // Для FLOAT устраняем шум двоичной арифметики: округляем до 6 знаков.
-                return "COALESCE(REPLACE(CAST(CAST(ROUND(" + col + ", 6) AS DECIMAL(38, 6)) AS VARCHAR(1000)), ',', '.'), '<NULL>')";
+                return "COALESCE(REPLACE(CAST(CAST(ROUND(" + col + ", 6) AS DECIMAL(38, 6)) AS VARCHAR(32765)), ',', '.'), '<NULL>')";
             case java.sql.Types.DOUBLE:
                 // Для DOUBLE устраняем шум хвостов (например ...000001 vs ...000000).
-                return "COALESCE(REPLACE(CAST(CAST(ROUND(" + col + ", 6) AS DECIMAL(38, 6)) AS VARCHAR(1000)), ',', '.'), '<NULL>')";
+                return "COALESCE(REPLACE(CAST(CAST(ROUND(" + col + ", 6) AS DECIMAL(38, 6)) AS VARCHAR(32765)), ',', '.'), '<NULL>')";
             case java.sql.Types.NUMERIC:
             case java.sql.Types.DECIMAL:
                 // В некоторых БД Firebird CAST(... AS VARCHAR) для decimal использует запятую.
                 // Нормализуем десятичный разделитель к точке, как в Flink/Iceberg.
-                return "COALESCE(REPLACE(CAST(" + col + " AS VARCHAR(1000)), ',', '.'), '<NULL>')";
+                return "COALESCE(REPLACE(CAST(" + col + " AS VARCHAR(32765)), ',', '.'), '<NULL>')";
             case java.sql.Types.TIME_WITH_TIMEZONE:
                 // В текущем JDBC-потоке TIME WITH TIME ZONE фактически теряется до секунд.
                 // Приводим Firebird-сторону к HH:mm:ss.0000, чтобы синхронизировать hash.
-                return "COALESCE(SUBSTRING(CAST(CAST(" + col + " AS TIME) AS VARCHAR(1000)) FROM 1 FOR 8) || '.0000', '<NULL>')";
+                return "COALESCE(SUBSTRING(CAST(CAST(" + col + " AS TIME) AS VARCHAR(32765)) FROM 1 FOR 8) || '.0000', '<NULL>')";
             case java.sql.Types.TIME:
                 // Для обычного TIME также фиксируем формат до 4 знаков долей секунды.
-                return "COALESCE(SUBSTRING(CAST(" + col + " AS VARCHAR(1000)) FROM 1 FOR 8) || '.0000', '<NULL>')";
+                return "COALESCE(SUBSTRING(CAST(" + col + " AS VARCHAR(32765)) FROM 1 FOR 8) || '.0000', '<NULL>')";
             case java.sql.Types.TIMESTAMP_WITH_TIMEZONE:
-                return "COALESCE(CAST(CAST(" + col + " AS TIMESTAMP) AS VARCHAR(1000)), '<NULL>')";
+                return "COALESCE(CAST(CAST(" + col + " AS TIMESTAMP) AS VARCHAR(32765)), '<NULL>')";
             default:
-                return "COALESCE(CAST(" + col + " AS VARCHAR(1000)), '<NULL>')";
+                return "COALESCE(" + safeString1000 + ", '<NULL>')";
         }
     }
 
