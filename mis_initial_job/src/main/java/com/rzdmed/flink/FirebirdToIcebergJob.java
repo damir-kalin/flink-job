@@ -26,8 +26,14 @@ import org.apache.flink.util.CloseableIterator;
 import org.apache.flink.table.api.StatementSet;
 
 import java.sql.*;
+import java.time.LocalDate;
+import java.time.LocalTime;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
@@ -1076,7 +1082,6 @@ public class FirebirdToIcebergJob {
                 if (i > 0) query.append(", ");
                 query.append(escapeFirebirdIdentifier(columns.get(i).name));
             }
-            query.append(", ").append(buildFirebirdRowHashExpression(columns)).append(" AS ROW_HASH");
             query.append(" FROM ").append(escapeFirebirdIdentifier(tableName));
             query.append(" WHERE ").append(watermarkCondition);
             query.append(" ORDER BY ").append(escapeFirebirdIdentifier(orderByColumn));
@@ -1110,7 +1115,7 @@ public class FirebirdToIcebergJob {
                         row.setField(o + 6, "mis");                // src_system_code
                         row.setField(o + 7, null);                 // extract_dttm
                         row.setField(o + 8, null);                 // src_chng_dttm
-                        row.setField(o + 9, FirebirdToIcebergJob.normalizeRowHash(rs.getObject(srcCols + 1))); // row_hash (MD5 hex, рассчитан в Firebird)
+                        row.setField(o + 9, FirebirdToIcebergJob.computeRowHashJava(columns, row)); // row_hash (MD5 hex, рассчитан в Java)
                         row.setField(o + 10, null);                // row_hash_iceberg (рассчитывается в INSERT SQL)
 
                         // Атомарно: emit + increment offset (под checkpoint lock)
@@ -1584,6 +1589,107 @@ public class FirebirdToIcebergJob {
             hexChars[i * 2 + 1] = digits[v & 0x0F];
         }
         return new String(hexChars);
+    }
+
+    /**
+     * Вычисляет row_hash в Java, чтобы не строить огромный SQL-выражение CRYPT_HASH(...)
+     * для широких таблиц (иначе Firebird может падать с "Implementation limit exceeded; COLUMN").
+     */
+    static String computeRowHashJava(List<ColumnInfo> columns, Row row) {
+        StringBuilder concat = new StringBuilder();
+        for (int i = 0; i < columns.size(); i++) {
+            if (i > 0) {
+                concat.append('|');
+            }
+            concat.append(toHashTokenJava(columns.get(i), row.getField(i)));
+        }
+        try {
+            MessageDigest md = MessageDigest.getInstance("MD5");
+            byte[] digest = md.digest(concat.toString().getBytes(StandardCharsets.UTF_8));
+            return bytesToHexLower(digest);
+        } catch (Exception e) {
+            throw new RuntimeException("Unable to compute MD5 row hash in Java", e);
+        }
+    }
+
+    static String toHashTokenJava(ColumnInfo column, Object value) {
+        if (value == null) {
+            return "<NULL>";
+        }
+
+        String s;
+        switch (column.jdbcType) {
+            case java.sql.Types.REAL:
+            case java.sql.Types.FLOAT:
+            case java.sql.Types.DOUBLE:
+                if (value instanceof Number) {
+                    BigDecimal bd = BigDecimal.valueOf(((Number) value).doubleValue())
+                        .setScale(6, RoundingMode.HALF_UP);
+                    s = bd.toPlainString();
+                } else {
+                    s = value.toString();
+                }
+                break;
+            case java.sql.Types.NUMERIC:
+            case java.sql.Types.DECIMAL:
+                if (value instanceof BigDecimal) {
+                    s = ((BigDecimal) value).toPlainString();
+                } else {
+                    s = value.toString();
+                }
+                s = s.replace(',', '.');
+                break;
+            case java.sql.Types.TIME:
+            case java.sql.Types.TIME_WITH_TIMEZONE:
+                if (value instanceof LocalTime) {
+                    String timeBase = value.toString();
+                    s = timeBase.contains(".") ? timeBase : (timeBase + ".0000");
+                } else {
+                    String timeBase = value.toString();
+                    s = timeBase.contains(".") ? timeBase : (timeBase + ".0000");
+                }
+                break;
+            case java.sql.Types.TIMESTAMP:
+            case java.sql.Types.TIMESTAMP_WITH_TIMEZONE:
+                if (value instanceof LocalDateTime) {
+                    s = ((LocalDateTime) value).format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSSS"));
+                } else {
+                    s = value.toString().replace('T', ' ');
+                }
+                break;
+            case java.sql.Types.DATE:
+                if (value instanceof LocalDate) {
+                    s = value.toString();
+                } else {
+                    s = value.toString();
+                }
+                break;
+            case java.sql.Types.CHAR:
+            case java.sql.Types.NCHAR:
+                s = value.toString();
+                if (column.precision > 0 && s.length() < column.precision) {
+                    s = s + " ".repeat(column.precision - s.length());
+                }
+                break;
+            case java.sql.Types.BINARY:
+            case java.sql.Types.VARBINARY:
+            case java.sql.Types.LONGVARBINARY:
+            case java.sql.Types.BLOB:
+                if (value instanceof byte[]) {
+                    s = bytesToHexLower((byte[]) value);
+                } else {
+                    s = value.toString();
+                }
+                break;
+            default:
+                s = value.toString();
+                break;
+        }
+
+        if (s.length() > 1000) {
+            s = s.substring(0, 1000);
+        }
+        return s;
     }
 
     /**
